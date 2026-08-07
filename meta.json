@@ -1,0 +1,29 @@
+{
+  "$schema": "https://dl.viam.dev/module.schema.json",
+  "module_id": "viam-soleng:nmea-device-discovery",
+  "visibility": "public_unlisted",
+  "url": "https://github.com/viam-soleng/nmea-device-discovery",
+  "description": "NMEA 2000 device inventory sensor. Reports every NMEA device seen on the network",
+  "models": [
+    {
+      "api": "rdk:component:sensor",
+      "model": "viam-soleng:nmea-device-discovery:devicelist",
+      "short_description": "A Viam sensor that inventories NMEA 2000 devices.",
+      "markdown_link": "viam-soleng_nmea-device-discovery_devicelist.md"
+    }
+  ],
+  "applications": null,
+  "markdown_link": "README.md",
+  "entrypoint": "bin/nmea-device-discovery",
+  "first_run": "",
+  "build": {
+    "build": "make module.tar.gz",
+    "setup": "make setup",
+    "path": "module.tar.gz",
+    "arch": [
+      "linux/amd64",
+      "linux/arm64",
+      "darwin/arm64"
+    ]
+  }
+}

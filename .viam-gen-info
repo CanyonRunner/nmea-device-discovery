@@ -1,0 +1,13 @@
+{
+  "module_name": "nmea-device-discovery",
+  "visibility": "public_unlisted",
+  "namespace": "viam-soleng",
+  "language": "go",
+  "resource_type": "component",
+  "resource_subtype": "sensor",
+  "model_name": "devicelist",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-08-07T13:03:15.358781345Z",
+  "module_readme_link": "README.md"
+}
