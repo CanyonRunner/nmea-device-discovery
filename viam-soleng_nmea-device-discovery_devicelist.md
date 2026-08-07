@@ -46,7 +46,7 @@ sensor plus this model depending on it:
 {
   "components": [
     {
-      "name": "allpgn",
+      "name": "all-pgn",
       "api": "rdk:component:sensor",
       "model": "viam-labs:viamboat:boat-all-pgn",
       "attributes": { "reader": "can0" }
@@ -55,8 +55,8 @@ sensor plus this model depending on it:
       "name": "devicelist",
       "api": "rdk:component:sensor",
       "model": "viam-soleng:nmea-device-discovery:devicelist",
-      "attributes": { "all-pgn-component": "allpgn" },
-      "depends_on": ["allpgn"]
+      "attributes": { "all-pgn-component": "all-pgn" },
+      "depends_on": ["all-pgn"]
     }
   ]
 }
