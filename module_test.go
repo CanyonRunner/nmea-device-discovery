@@ -2,6 +2,7 @@ package nmeadevicediscovery
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"go.viam.com/rdk/components/sensor"
@@ -52,9 +53,9 @@ func TestReadingsMergesIdentityPGNsPerDevice(t *testing.T) {
 	test.That(t, fake.gotExtra["pgns"], test.ShouldResemble,
 		[]interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo})
 
-	// One device, keyed by unique number + manufacturer code.
+	// One device, labeled "<mfg> <model> [<unique number>]".
 	test.That(t, len(got), test.ShouldEqual, 1)
-	dev, ok := got["12345-999"].(map[string]interface{})
+	dev, ok := got["999 CR Box [12345]"].(map[string]interface{})
 	test.That(t, ok, test.ShouldBeTrue)
 
 	// Fields merged from all three PGNs, renamed to snake_case.
@@ -84,9 +85,10 @@ func TestReadingsDeduplicatesMovedDevice(t *testing.T) {
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	// One device, at its most recent address.
+	// One device, at its most recent address. No product info seen, so the
+	// label is the manufacturer alone.
 	test.That(t, len(got), test.ShouldEqual, 1)
-	dev := got["12345-999"].(map[string]interface{})
+	dev := got["999 [12345]"].(map[string]interface{})
 	test.That(t, dev["src"], test.ShouldEqual, 43)
 	test.That(t, dev["last_seen"], test.ShouldEqual, "29 Jul 26 14:10 +0000")
 }
@@ -106,11 +108,43 @@ func TestReadingsKeyFormatsLargeUniqueNumber(t *testing.T) {
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	_, bad := got["1.037921e+06-Garmin"]
-	test.That(t, bad, test.ShouldBeFalse)
-	dev, ok := got["1037921-Garmin"].(map[string]interface{})
+	for k := range got {
+		test.That(t, strings.Contains(k, "e+"), test.ShouldBeFalse)
+	}
+	dev, ok := got["Garmin [1037921]"].(map[string]interface{})
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, dev["src"], test.ShouldEqual, 3)
+}
+
+func TestReadingsKeySanitizesModelStrings(t *testing.T) {
+	// Real-network values: a Furuno MFD reports a NUL-terminated fixed-length
+	// model_id with junk after the terminator, and Simrad pads with doubled
+	// spaces. Keys must stay clean; the model_id FIELD keeps the raw value.
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-0": entry(60928, 0, "07 Aug 26 16:55 -0400", map[string]interface{}{
+			"Unique Number": float64(51359), "Manufacturer Code": "Furuno",
+		}),
+		"126996-0": entry(126996, 0, "07 Aug 26 16:55 -0400", map[string]interface{}{
+			"Model ID": "TZT14\x004 TZT",
+		}),
+		"60928-2": entry(60928, 2, "07 Aug 26 16:55 -0400", map[string]interface{}{
+			"Unique Number": float64(1589637), "Manufacturer Code": "Simrad",
+		}),
+		"126996-2": entry(126996, 2, "07 Aug 26 16:55 -0400", map[string]interface{}{
+			"Model ID": "NSS4-12  iGPS",
+		}),
+	}}
+
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	furuno, ok := got["Furuno TZT14 [51359]"].(map[string]interface{})
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, furuno["model_id"], test.ShouldEqual, "TZT14\x004 TZT")
+
+	_, ok = got["Simrad NSS4-12 iGPS [1589637]"]
+	test.That(t, ok, test.ShouldBeTrue)
 }
 
 func TestReadingsDeviceWithoutClaimKeyedByAddress(t *testing.T) {
@@ -125,7 +159,8 @@ func TestReadingsDeviceWithoutClaimKeyedByAddress(t *testing.T) {
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	dev, ok := got["src-7"].(map[string]interface{})
+	// No address claim seen: the source address stands in for identity.
+	dev, ok := got["Mystery Box [src-7]"].(map[string]interface{})
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, dev["model_id"], test.ShouldEqual, "Mystery Box")
 }

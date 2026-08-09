@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	sensor "go.viam.com/rdk/components/sensor"
@@ -178,8 +179,15 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		perSrc[src][pgn] = entry
 	}
 
-	devices := map[string]interface{}{}
-	lastSeenByKey := map[string]time.Time{}
+	// Merge each source's entries into one device object and de-duplicate by
+	// stable identity: a device that moved addresses (contention, commanded
+	// address) appears under several sources, and only its most recent
+	// incarnation is kept.
+	type mergedDevice struct {
+		fields   map[string]interface{}
+		lastSeen time.Time
+	}
+	winners := map[string]mergedDevice{} // keyed by stable identity
 	for src, entries := range perSrc {
 		device := map[string]interface{}{"src": src}
 		var lastSeen time.Time
@@ -206,33 +214,80 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		}
 
 		// Stable identity from the address claim; a device we have only seen
-		// identity fragments from (no claim yet) is keyed by its address.
-		key := fmt.Sprintf("src-%d", src)
-		if claim, has := entries[pgnAddressClaim]; has {
-			// Numeric values arrive as float64 after a structpb hop, and %v
-			// renders large floats in scientific notation (1.037921e+06);
-			// normalize to integers so keys stay readable and stable.
-			unique := claim["Unique Number"]
-			if n, ok := asInt(unique); ok {
-				unique = n
-			}
-			mfg := claim["Manufacturer Code"] // stays a string for known makers ("Garmin")
-			if n, ok := asInt(mfg); ok {
-				mfg = n
-			}
-			key = fmt.Sprintf("%v-%v", unique, mfg)
+		// identity fragments from (no claim yet) is identified by its address.
+		identity := fmt.Sprintf("src-%d", src)
+		if _, has := entries[pgnAddressClaim]; has {
+			identity = fmt.Sprintf("%v-%v", intIfNumeric(device["unique_number"]), intIfNumeric(device["manufacturer_code"]))
 		}
 
-		// A device that moved addresses appears under several sources with the
-		// same identity; keep only its most recent incarnation.
-		if prev, seen := lastSeenByKey[key]; seen && !lastSeen.After(prev) {
+		if prev, seen := winners[identity]; seen && !lastSeen.After(prev.lastSeen) {
 			continue
 		}
-		lastSeenByKey[key] = lastSeen
-		devices[key] = device
+		winners[identity] = mergedDevice{fields: device, lastSeen: lastSeen}
+	}
+
+	// Render display keys from the winners: "<manufacturer> <model> [<unique>]"
+	// reads like a device name in the Viam app, while the bracketed unique
+	// number (or source address for claim-less devices) keeps keys unique when
+	// a network carries several identical products.
+	devices := map[string]interface{}{}
+	for identity, w := range winners {
+		devices[deviceDisplayKey(identity, w.fields)] = w.fields
 	}
 
 	return devices, nil
+}
+
+// intIfNumeric normalizes a value to int when it is numeric. Values arrive as
+// float64 after a structpb hop, and %v renders large floats in scientific
+// notation (1.037921e+06); lookup-rendered strings ("Garmin") pass through.
+func intIfNumeric(v interface{}) interface{} {
+	if n, ok := asInt(v); ok {
+		return n
+	}
+	return v
+}
+
+// sanitizeLabel makes a decoded NMEA string safe and tidy for use in a map
+// key. Fixed-length string fields follow the C convention of NUL termination
+// with junk after the terminator (a real Furuno MFD reports model_id
+// "TZT14\x004 TZT" — the model is "TZT14"), and model IDs often carry doubled
+// spaces; truncate at the first NUL, then collapse whitespace and controls.
+func sanitizeLabel(s string) string {
+	if i := strings.IndexByte(s, 0); i >= 0 {
+		s = s[:i]
+	}
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool {
+		return r <= ' ' || r == 0x7F
+	}), " ")
+}
+
+// deviceDisplayKey builds the human-facing map key for a merged device:
+// "<manufacturer> <model> [<unique number>]", with graceful fallbacks when
+// product info or the address claim has not been seen yet.
+func deviceDisplayKey(identity string, device map[string]interface{}) string {
+	label := ""
+	if mfg, has := device["manufacturer_code"]; has {
+		label = fmt.Sprintf("%v", intIfNumeric(mfg))
+	}
+	if model, ok := device["model_id"].(string); ok {
+		if clean := sanitizeLabel(model); clean != "" {
+			if label != "" {
+				label += " "
+			}
+			label += clean
+		}
+	}
+
+	suffix := identity // "src-N" for claim-less devices
+	if unique, ok := asInt(device["unique_number"]); ok {
+		suffix = fmt.Sprintf("%d", unique)
+	}
+
+	if label == "" {
+		return suffix
+	}
+	return fmt.Sprintf("%s [%s]", label, suffix)
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
