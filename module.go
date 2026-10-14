@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	sensor "go.viam.com/rdk/components/sensor"
@@ -37,6 +40,9 @@ type Config struct {
 	// broken out per engine or tank. On by default; set it to false to push
 	// the identity-PGN filter down to all-pgn and omit the list.
 	TrackInstances *bool `json:"track-instances,omitempty"`
+	// Persist keeps a JSON file under VIAM_MODULE_DATA so first_seen survives
+	// restarts and devices that left the bus stay listed. On by default.
+	Persist *bool `json:"persist,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -62,8 +68,14 @@ type nmeaDeviceDiscoveryDevicelist struct {
 
 	// allPgn is the viamboat boat-all-pgn sensor this model reads through. It
 	// holds the bus history (latest message per PGN and source, with
-	// timestamps); this model keeps no state of its own.
+	// timestamps) since viamboat last started.
 	allPgn sensor.Sensor
+
+	// state is what this model remembers across restarts (see state.go);
+	// statePath is "" when persistence is off or VIAM_MODULE_DATA is unset.
+	mu        sync.Mutex
+	state     *persistedState
+	statePath string
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -92,8 +104,25 @@ func NewDevicelist(ctx context.Context, deps resource.Dependencies, name resourc
 		logger:     logger,
 		cfg:        conf,
 		allPgn:     allPgn,
+		state:      newState(),
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
+	}
+
+	if s.persist() {
+		if dir := os.Getenv("VIAM_MODULE_DATA"); dir != "" {
+			s.statePath = filepath.Join(dir, name.ShortName()+"-devices.json")
+			if st, err := loadState(s.statePath); err != nil {
+				logger.Warnw("could not load persisted devices; starting empty", "path", s.statePath, "error", err)
+			} else {
+				s.state = st
+				if n := len(st.Devices); n > 0 {
+					logger.Infow("loaded persisted devices", "path", s.statePath, "devices", n)
+				}
+			}
+		} else {
+			logger.Warn("VIAM_MODULE_DATA is not set; first_seen and offline devices will not survive restarts")
+		}
 	}
 	return s, nil
 }
@@ -160,11 +189,18 @@ func (s *nmeaDeviceDiscoveryDevicelist) trackInstances() bool {
 	return s.cfg == nil || s.cfg.TrackInstances == nil || *s.cfg.TrackInstances
 }
 
+// persist reports the effective setting: true unless "persist": false.
+func (s *nmeaDeviceDiscoveryDevicelist) persist() bool {
+	return s.cfg == nil || s.cfg.Persist == nil || *s.cfg.Persist
+}
+
 // instanceSeen is one (PGN, instance) pair a source address transmits, e.g.
 // Engine Parameters for engine 1 or Fluid Level for tank 2.
 type instanceSeen struct {
 	pgn, instance int
 	description   string
+	firstSeen     time.Time
+	firstSeenRaw  string
 	lastSeen      time.Time
 	lastSeenRaw   string
 }
@@ -192,15 +228,47 @@ func parseTimestamp(entry map[string]interface{}) (time.Time, string, bool) {
 	return ts, raw, err == nil
 }
 
-// Readings returns one entry per device seen on the NMEA 2000 network, built
-// by filtering the all-pgn sensor's accumulated history down to the identity
-// PGNs and merging them per device. Devices are identified by their ISO NAME
-// from the address claim (unique number, manufacturer, device instance and
-// function; see stableIdentity) rather than by source address: addresses
-// move under contention, and keying by address would report ghost devices
-// at stale addresses. Entries are never pruned; last_seen lets the caller
-// decide what is stale.
+// Readings returns one entry per device seen on the NMEA 2000 network: the
+// devices in the all-pgn sensor's current history, merged per device from
+// the identity PGNs, plus the devices remembered in the state file that the
+// bus has not heard from since viamboat restarted. Devices are identified by
+// their ISO NAME from the address claim (unique number, manufacturer, device
+// instance and function; see stableIdentity) rather than by source address:
+// addresses move under contention, and keying by address would report ghost
+// devices at stale addresses. Entries are never pruned; first_seen and
+// last_seen let the caller decide what is new or stale.
 func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+	live, err := s.liveDevices(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.state == nil {
+		s.state = newState()
+	}
+	merged, changed := s.state.merge(live, time.Now())
+	if changed && s.statePath != "" {
+		if err := s.state.save(s.statePath); err != nil {
+			s.logger.Warnw("could not persist devices", "path", s.statePath, "error", err)
+		}
+	}
+	s.mu.Unlock()
+
+	// Render display keys: "<manufacturer> <model> [<unique>]" reads like a
+	// device name in the Viam app, while the bracketed unique number (or
+	// source address for claim-less devices) keeps keys unique when a network
+	// carries several identical products.
+	devices := map[string]interface{}{}
+	for key, m := range disambiguate(merged) {
+		devices[key] = m.render(s.trackInstances())
+	}
+	return devices, nil
+}
+
+// liveDevices reads the all-pgn history and merges it into one mergedDevice
+// per stable identity, keyed by that identity.
+func (s *nmeaDeviceDiscoveryDevicelist) liveDevices(ctx context.Context) (map[string]mergedDevice, error) {
 	// By default the filter is pushed down to the all-pgn sensor so only the
 	// identity PGNs cross the hop. Instance tracking needs the whole history:
 	// any PGN may carry an instance, so no fixed list would stay correct.
@@ -261,112 +329,71 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		}
 	}
 
-	// Merge each source's entries into one device object and de-duplicate by
-	// stable identity: a device that moved addresses (contention, commanded
-	// address) appears under several sources, and only its most recent
-	// incarnation is kept.
-	winners := map[string]mergedDevice{} // keyed by stable identity
+	// Merge each source's entries into one device and de-duplicate by stable
+	// identity: a device that moved addresses (contention, commanded address)
+	// appears under several sources, and only its most recent incarnation is
+	// kept.
+	winners := map[string]mergedDevice{}
 	for src, entries := range perSrc {
-		device := map[string]interface{}{"src": src}
-		var lastSeen time.Time
-		lastSeenRaw := ""
-		instanceCount := 0
+		m := mergedDevice{src: src, fields: map[string]interface{}{}, instances: map[string]instanceSeen{}}
 		for pgn, entry := range entries {
 			for from, to := range identityFieldNames[pgn] {
 				if val, has := entry[from]; has {
-					device[to] = val
+					m.fields[to] = val
 				}
 			}
 			// The all-pgn timestamp is CANTimeFormat.String() (RFC822Z);
-			// last_seen is the newest across the merged entries.
-			if ts, tsRaw, parsed := parseTimestamp(entry); parsed && ts.After(lastSeen) {
-				lastSeen = ts
-				lastSeenRaw = tsRaw
-			} else if tsRaw != "" && !parsed && lastSeenRaw == "" {
-				lastSeenRaw = tsRaw
+			// last_seen is the newest across the merged entries, first_seen
+			// (before the state file has a say) the oldest.
+			ts, tsRaw, parsed := parseTimestamp(entry)
+			if parsed {
+				m.noteSeen(ts, tsRaw)
+			} else if tsRaw != "" && m.lastSeenRaw == "" {
+				m.lastSeenRaw = tsRaw
 			}
 		}
 		// Instanced data is sent far more often than identity PGNs, so it is
 		// the better liveness signal: a gateway streaming engine data is on
 		// the bus even if its last address claim is hours old.
-		if s.trackInstances() {
-			instances := make([]instanceSeen, 0, len(instancesPerSrc[src]))
-			instanceCount = len(instancesPerSrc[src])
-			for _, inst := range instancesPerSrc[src] {
-				instances = append(instances, inst)
-				if inst.lastSeen.After(lastSeen) {
-					lastSeen = inst.lastSeen
-					lastSeenRaw = inst.lastSeenRaw
-				}
+		for k, inst := range instancesPerSrc[src] {
+			m.instances[k] = inst
+			if !inst.lastSeen.IsZero() {
+				m.noteSeen(inst.lastSeen, inst.lastSeenRaw)
 			}
-			sort.Slice(instances, func(i, j int) bool {
-				if instances[i].pgn != instances[j].pgn {
-					return instances[i].pgn < instances[j].pgn
-				}
-				return instances[i].instance < instances[j].instance
-			})
-			rendered := make([]interface{}, 0, len(instances))
-			for _, inst := range instances {
-				m := map[string]interface{}{
-					"pgn":      inst.pgn,
-					"instance": inst.instance,
-				}
-				if inst.description != "" {
-					m["description"] = inst.description
-				}
-				if inst.lastSeenRaw != "" {
-					m["last_seen"] = inst.lastSeenRaw
-				}
-				rendered = append(rendered, m)
-			}
-			device["instances"] = rendered
-		}
-		if lastSeenRaw != "" {
-			device["last_seen"] = lastSeenRaw
 		}
 
 		// Stable identity from the address claim; a device we have only seen
 		// identity fragments from (no claim yet) is identified by its address.
-		identity := fmt.Sprintf("src-%d", src)
-		if _, has := entries[pgnAddressClaim]; has {
-			identity = stableIdentity(device)
+		_, m.hasClaim = entries[pgnAddressClaim]
+		m.identity = fmt.Sprintf("src-%d", src)
+		if m.hasClaim {
+			m.identity = stableIdentity(m.fields)
 		}
 
-		candidate := mergedDevice{fields: device, src: src, lastSeen: lastSeen, instanceCount: instanceCount}
-		if prev, seen := winners[identity]; seen && !candidate.beats(prev) {
+		if prev, seen := winners[m.identity]; seen && !m.beats(prev) {
 			continue
 		}
-		winners[identity] = candidate
+		winners[m.identity] = m
 	}
-
-	// Render display keys from the winners: "<manufacturer> <model> [<unique>]"
-	// reads like a device name in the Viam app, while the bracketed unique
-	// number (or source address for claim-less devices) keeps keys unique when
-	// a network carries several identical products.
-	devices := map[string]interface{}{}
-	for key, w := range disambiguate(winners) {
-		devices[key] = w.fields
-	}
-
-	return devices, nil
+	return winners, nil
 }
 
-// disambiguate renders display keys for the winners and resolves collisions:
+// disambiguate renders display keys for the devices and resolves collisions:
 // distinct devices can share manufacturer, model and unique number (the two
 // halves of a dual gateway differ only by device instance; a plotter's
 // virtual nodes differ by device function). A colliding group gets the
 // shortest qualifier that tells its members apart: " #<device instance>",
 // then also " (<device function>)", then also " (src <n>)".
-func disambiguate(winners map[string]mergedDevice) map[string]mergedDevice {
+func disambiguate(devices map[string]mergedDevice) map[string]mergedDevice {
 	byKey := map[string][]mergedDevice{}
-	for identity, w := range winners {
-		k := deviceDisplayKey(identity, w.fields)
-		byKey[k] = append(byKey[k], w)
+	for identity, m := range devices {
+		k := deviceDisplayKey(identity, m.fields)
+		byKey[k] = append(byKey[k], m)
 	}
 	qualifiers := []func(mergedDevice) string{
-		func(w mergedDevice) string { return fmt.Sprintf(" #%d", deviceInstance(w.fields)) },
-		func(w mergedDevice) string { return fmt.Sprintf(" (%v)", intIfNumeric(w.fields["device_function"])) },
-		func(w mergedDevice) string { return fmt.Sprintf(" (src %d)", w.src) },
+		func(m mergedDevice) string { return fmt.Sprintf(" #%d", deviceInstance(m.fields)) },
+		func(m mergedDevice) string { return fmt.Sprintf(" (%v)", intIfNumeric(m.fields["device_function"])) },
+		func(m mergedDevice) string { return fmt.Sprintf(" (src %d)", m.src) },
 	}
 	out := map[string]mergedDevice{}
 	for base, group := range byKey {
@@ -378,10 +405,10 @@ func disambiguate(winners map[string]mergedDevice) map[string]mergedDevice {
 			keys := make([]string, len(group))
 			unique := true
 			seen := map[string]bool{}
-			for i, w := range group {
+			for i, m := range group {
 				keys[i] = base
 				for _, q := range qualifiers[:level] {
-					keys[i] += q(w)
+					keys[i] += q(m)
 				}
 				if seen[keys[i]] {
 					unique = false
@@ -389,8 +416,8 @@ func disambiguate(winners map[string]mergedDevice) map[string]mergedDevice {
 				seen[keys[i]] = true
 			}
 			if unique || level == len(qualifiers) {
-				for i, w := range group {
-					out[keys[i]] = w
+				for i, m := range group {
+					out[keys[i]] = m
 				}
 				break
 			}
@@ -421,31 +448,96 @@ func deviceInstance(device map[string]interface{}) int {
 	return lower | upper<<3
 }
 
-// mergedDevice is one source address's merged identity entries, competing
-// with the same device's other addresses for the single reported entry.
+// mergedDevice is one device: its identity fields merged from the identity
+// PGNs, the address it was last heard at, when it was first and last seen,
+// and the (PGN, instance) pairs it transmits.
 type mergedDevice struct {
-	fields        map[string]interface{}
-	src           int
-	lastSeen      time.Time
-	instanceCount int
+	identity string
+	hasClaim bool
+	// fields holds the snake_case identity fields; src, first_seen, last_seen
+	// and instances are rendered from the other members.
+	fields       map[string]interface{}
+	src          int
+	firstSeen    time.Time
+	firstSeenRaw string
+	lastSeen     time.Time
+	lastSeenRaw  string
+	instances    map[string]instanceSeen // keyed "<pgn>/<instance>"
 }
 
-// beats decides which address of a device is reported. Newest last_seen
-// wins; the all-pgn timestamps have one-minute resolution, so ties are
-// common and must not fall through to map iteration order. On a tie prefer
-// the address with live instanced traffic, then the more completely
-// described one, then the lower address.
+// noteSeen widens the first/last seen window by one bus timestamp.
+func (m *mergedDevice) noteSeen(ts time.Time, raw string) {
+	if m.lastSeenRaw == "" || ts.After(m.lastSeen) {
+		m.lastSeen, m.lastSeenRaw = ts, raw
+	}
+	if m.firstSeenRaw == "" || ts.Before(m.firstSeen) {
+		m.firstSeen, m.firstSeenRaw = ts, raw
+	}
+}
+
+// beats decides which address of a device is reported when the history
+// holds it at several. Newest last_seen wins; the all-pgn timestamps have
+// one-minute resolution, so ties are common and must not fall through to
+// map iteration order. On a tie prefer the address with live instanced
+// traffic, then the more completely described one, then the lower address.
 func (m mergedDevice) beats(prev mergedDevice) bool {
 	if !m.lastSeen.Equal(prev.lastSeen) {
 		return m.lastSeen.After(prev.lastSeen)
 	}
-	if m.instanceCount != prev.instanceCount {
-		return m.instanceCount > prev.instanceCount
+	if len(m.instances) != len(prev.instances) {
+		return len(m.instances) > len(prev.instances)
 	}
 	if len(m.fields) != len(prev.fields) {
 		return len(m.fields) > len(prev.fields)
 	}
 	return m.src < prev.src
+}
+
+// render produces the reading entry for the device.
+func (m mergedDevice) render(withInstances bool) map[string]interface{} {
+	out := make(map[string]interface{}, len(m.fields)+4)
+	for k, v := range m.fields {
+		out[k] = v
+	}
+	out["src"] = m.src
+	if m.firstSeenRaw != "" {
+		out["first_seen"] = m.firstSeenRaw
+	}
+	if m.lastSeenRaw != "" {
+		out["last_seen"] = m.lastSeenRaw
+	}
+	if !withInstances {
+		return out
+	}
+	instances := make([]instanceSeen, 0, len(m.instances))
+	for _, inst := range m.instances {
+		instances = append(instances, inst)
+	}
+	sort.Slice(instances, func(i, j int) bool {
+		if instances[i].pgn != instances[j].pgn {
+			return instances[i].pgn < instances[j].pgn
+		}
+		return instances[i].instance < instances[j].instance
+	})
+	rendered := make([]interface{}, 0, len(instances))
+	for _, inst := range instances {
+		e := map[string]interface{}{
+			"pgn":      inst.pgn,
+			"instance": inst.instance,
+		}
+		if inst.description != "" {
+			e["description"] = inst.description
+		}
+		if inst.firstSeenRaw != "" {
+			e["first_seen"] = inst.firstSeenRaw
+		}
+		if inst.lastSeenRaw != "" {
+			e["last_seen"] = inst.lastSeenRaw
+		}
+		rendered = append(rendered, e)
+	}
+	out["instances"] = rendered
+	return out
 }
 
 // intIfNumeric normalizes a value to int when it is numeric. Values arrive as
@@ -500,8 +592,82 @@ func deviceDisplayKey(identity string, device map[string]interface{}) string {
 	return fmt.Sprintf("%s [%s]", label, suffix)
 }
 
+// DoCommand supports:
+//
+//	{"command": "devices"}                   same as Readings
+//	{"command": "forget", "device": "<key>"} drop one remembered device, by its
+//	                                         reading key (or "identity")
+//	{"command": "reset"}                     forget every remembered device
+//	{"command": "status"}                    persistence settings and counts
 func (s *nmeaDeviceDiscoveryDevicelist) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("not implemented")
+	command, _ := cmd["command"].(string)
+	switch command {
+	case "", "devices":
+		return s.Readings(ctx, nil)
+
+	case "forget":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.state == nil {
+			s.state = newState()
+		}
+		identity, _ := cmd["identity"].(string)
+		if key, ok := cmd["device"].(string); ok && identity == "" {
+			remembered := map[string]mergedDevice{}
+			for id, p := range s.state.Devices {
+				remembered[id] = fromPersisted(id, p)
+			}
+			for k, m := range disambiguate(remembered) {
+				if k == key {
+					identity = m.identity
+				}
+			}
+			if identity == "" {
+				return nil, fmt.Errorf("no remembered device %q", key)
+			}
+		}
+		if identity == "" {
+			return nil, errors.New("forget needs \"device\" (reading key) or \"identity\"")
+		}
+		if !s.state.forget(identity) {
+			return nil, fmt.Errorf("no remembered device with identity %q", identity)
+		}
+		return map[string]interface{}{"forgotten": identity}, s.saveLocked()
+
+	case "reset":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.state = newState()
+		if s.statePath != "" {
+			if err := os.Remove(s.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		return map[string]interface{}{"reset": true}, nil
+
+	case "status":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		n := 0
+		if s.state != nil {
+			n = len(s.state.Devices)
+		}
+		return map[string]interface{}{
+			"track_instances":    s.trackInstances(),
+			"persist":            s.persist(),
+			"persist_path":       s.statePath,
+			"remembered_devices": n,
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown command %q", command)
+}
+
+// saveLocked persists the state if a path is configured. Caller holds s.mu.
+func (s *nmeaDeviceDiscoveryDevicelist) saveLocked() error {
+	if s.statePath == "" {
+		return nil
+	}
+	return s.state.save(s.statePath)
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) Status(ctx context.Context) (map[string]interface{}, error) {
@@ -509,7 +675,6 @@ func (s *nmeaDeviceDiscoveryDevicelist) Status(ctx context.Context) (map[string]
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) Close(context.Context) error {
-	// Put close code here
 	s.cancelFunc()
 	return nil
 }

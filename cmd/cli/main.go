@@ -4,6 +4,11 @@
 //	viam machines part run --part <id> --component all-pgn --method GetReadings > dump.json
 //	go run ./cmd/cli dump.json
 //	go run ./cmd/cli -track-instances=false dump.json
+//	go run ./cmd/cli -data-dir ./state day1.json; go run ./cmd/cli -data-dir ./state day2.json
+//
+// With -data-dir the run persists state there (as VIAM_MODULE_DATA does on a
+// machine), so a second run over a later dump shows first_seen carried over
+// and devices missing from the later dump still listed.
 package main
 
 import (
@@ -65,9 +70,15 @@ func main() {
 
 func realMain() error {
 	track := flag.Bool("track-instances", true, "the track-instances attribute (default on)")
+	dataDir := flag.String("data-dir", "", "persist state in this directory across runs (stands in for VIAM_MODULE_DATA)")
 	flag.Parse()
+	if *dataDir != "" {
+		if err := os.Setenv("VIAM_MODULE_DATA", *dataDir); err != nil {
+			return err
+		}
+	}
 	if flag.NArg() != 1 {
-		return fmt.Errorf("usage: cli [-track-instances=false] <all-pgn-readings.json>")
+		return fmt.Errorf("usage: cli [-track-instances=false] [-data-dir DIR] <all-pgn-readings.json>")
 	}
 
 	readings, err := loadDump(flag.Arg(0))
@@ -76,9 +87,12 @@ func realMain() error {
 	}
 
 	ctx := context.Background()
-	logger := logging.NewLogger("cli")
+	// Logs to stderr so stdout stays parseable JSON.
+	logger := logging.NewBlankLogger("cli")
+	logger.AddAppender(logging.NewWriterAppender(os.Stderr))
 	deps := resource.Dependencies{sensor.Named("all-pgn"): &fileAllPgn{readings: readings}}
-	cfg := nmeadevicediscovery.Config{AllPGNComponent: "all-pgn", TrackInstances: track}
+	persist := *dataDir != ""
+	cfg := nmeadevicediscovery.Config{AllPGNComponent: "all-pgn", TrackInstances: track, Persist: &persist}
 
 	thing, err := nmeadevicediscovery.NewDevicelist(ctx, deps, sensor.Named("devicelist"), &cfg, logger)
 	if err != nil {
