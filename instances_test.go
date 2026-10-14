@@ -309,3 +309,32 @@ func TestCollidingLabelsGetShortestQualifier(t *testing.T) {
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, display["src"], test.ShouldEqual, 4) // tie on last_seen: lower address wins
 }
+
+func TestUnregisteredManufacturerGetsUnknownInIdentity(t *testing.T) {
+	// A box claiming an unregistered manufacturer code (e.g. the NMEA2000
+	// library's 2046 placeholder): viamboat drops the field entirely. Two
+	// such boxes must stay distinct, and the key must not read "<nil>".
+	claim := func(src, unique float64, fn string) map[string]interface{} {
+		return entry(60928, src, "12 Oct 26 13:45 -0400", map[string]interface{}{
+			"Unique Number": unique, "Device Function": fn, "Device Class": "Internetwork device",
+		})
+	}
+	fake := &filteringAllPgn{readings: map[string]interface{}{
+		"60928-80":  claim(80, 74565, "PC Gateway"),
+		"126996-80": entry(126996, 80, "12 Oct 26 13:44 -0400", map[string]interface{}{"Model ID": "CR Alert Test", "Model Serial Code": "CR0001"}),
+		"60928-81":  claim(81, 74566, "Ownship Position (Loran C)"),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{}}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, len(got), test.ShouldEqual, 2)
+	_, ok := got["CR Alert Test [74565]"]
+	test.That(t, ok, test.ShouldBeTrue)
+	_, ok = got["74566"]
+	test.That(t, ok, test.ShouldBeTrue)
+
+	dev := map[string]interface{}{"unique_number": float64(74565), "device_function": "PC Gateway"}
+	test.That(t, stableIdentity(dev), test.ShouldEqual, "74565-unknown-0-PC Gateway")
+	test.That(t, stableIdentity(map[string]interface{}{"unique_number": float64(7)}), test.ShouldEqual, "7-unknown-0-unknown")
+}

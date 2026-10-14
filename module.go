@@ -432,12 +432,25 @@ func disambiguate(devices map[string]mergedDevice) map[string]mergedDevice {
 // virtual nodes (Display, Button Interface) under one unique number, and an
 // Actisense dual gateway claims two addresses that differ only by device
 // instance. Both are live at once and must be reported separately.
+//
+// The decoder drops the manufacturer code (and can drop the function) when
+// the value is not in its lookup table, as with an unregistered code such as
+// the 2046 placeholder from the open-source NMEA2000 library. Those slots
+// read "unknown" rather than "<nil>" so the key stays legible and stable.
 func stableIdentity(device map[string]interface{}) string {
 	return fmt.Sprintf("%v-%v-%d-%v",
 		intIfNumeric(device["unique_number"]),
-		intIfNumeric(device["manufacturer_code"]),
+		fieldOrUnknown(device, "manufacturer_code"),
 		deviceInstance(device),
-		intIfNumeric(device["device_function"]))
+		fieldOrUnknown(device, "device_function"))
+}
+
+func fieldOrUnknown(device map[string]interface{}, key string) interface{} {
+	v, has := device[key]
+	if !has || v == nil || v == "" {
+		return "unknown"
+	}
+	return intIfNumeric(v)
 }
 
 // deviceInstance assembles the NMEA 2000 device instance from the two
