@@ -21,7 +21,7 @@ application. A device heard from only partially (for example, product info
 without an address claim) is keyed by its source address as `... [src-<n>]`
 until its claim is seen.
 
-With `track-instances` enabled, each entry also lists the instanced data
+By default (`track-instances`), each entry also lists the instanced data
 the device transmits: one `instances` element per (PGN, instance) pair, so
 an engine gateway reporting two engines shows Engine Parameters for
 instance 0 and 1, a tank sender its tanks, a battery monitor its banks.
@@ -52,12 +52,12 @@ The following attributes are available for this model:
 | Name                | Type    | Inclusion | Description                                                                 |
 |---------------------|---------|-----------|-----------------------------------------------------------------------------|
 | `all-pgn-component` | string  | Required  | Name of the viamboat `boat-all-pgn` sensor component to read the bus through |
-| `track-instances`   | boolean | Optional  | Default `false`. When `true`, read the whole all-pgn history instead of only the identity PGNs, and add an `instances` list to each device (see below). |
+| `track-instances`   | boolean | Optional  | Default `true`: read the whole all-pgn history and add an `instances` list to each device (see below). Set `false` to read only the identity PGNs and omit the list. |
 
-`track-instances` widens what crosses the all-pgn hop from the three
-identity PGNs to the full history (a few hundred entries on a typical
-network). The call is in-process on the machine, so the cost is negligible;
-the default stays off so existing readings keep their shape.
+With `track-instances` on, the whole all-pgn history crosses the hop (a few
+hundred entries on a typical network) instead of the three identity PGNs.
+The call is in-process on the machine, so the cost is negligible. Set it to
+`false` to get the upstream module's leaner readings.
 
 ### Example Configuration
 
@@ -77,7 +77,7 @@ sensor plus this model depending on it:
       "name": "devicelist",
       "api": "rdk:component:sensor",
       "model": "viam-soleng:nmea-device-discovery:devicelist",
-      "attributes": { "all-pgn-component": "all-pgn", "track-instances": true },
+      "attributes": { "all-pgn-component": "all-pgn" },
       "depends_on": ["all-pgn"]
     }
   ]
@@ -134,7 +134,7 @@ sensor plus this model depending on it:
 ```
 
 `instances` is sorted by PGN then instance and is present (possibly empty)
-on every device when `track-instances` is on. The instance is taken from
+on every device unless `track-instances` is `false`. The instance is taken from
 the all-pgn key (`<pgn>-<src>-<instance>`), or from the message's
 `Instance` field when the key has no instance segment; messages without
 an instance (position, heading, ...) are not listed. A device that has

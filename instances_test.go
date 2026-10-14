@@ -99,13 +99,15 @@ func twinEngineReadings() map[string]interface{} {
 	}
 }
 
+func boolPtr(b bool) *bool { return &b }
+
 func TestTrackInstancesOffKeepsFilterAndShape(t *testing.T) {
 	fake := &filteringAllPgn{readings: twinEngineReadings()}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{AllPGNComponent: "all-pgn"}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{AllPGNComponent: "all-pgn", TrackInstances: boolPtr(false)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	// Default behavior unchanged: identity filter pushed down, no new field.
+	// Explicitly off: identity filter pushed down, no instances field.
 	test.That(t, fake.gotExtra["pgns"], test.ShouldResemble,
 		[]interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo})
 	dev := got["Yamaha CL7 Gateway [88213]"].(map[string]interface{})
@@ -114,9 +116,20 @@ func TestTrackInstancesOffKeepsFilterAndShape(t *testing.T) {
 	test.That(t, dev["last_seen"], test.ShouldEqual, "14 Oct 26 07:00 -0400")
 }
 
+func TestTrackInstancesDefaultsOn(t *testing.T) {
+	fake := &filteringAllPgn{readings: twinEngineReadings()}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{AllPGNComponent: "all-pgn"}}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	_, filtered := fake.gotExtra["pgns"]
+	test.That(t, filtered, test.ShouldBeFalse)
+	test.That(t, len(instancesOf(t, got, "Yamaha CL7 Gateway [88213]")), test.ShouldEqual, 5)
+}
+
 func TestTrackInstancesBreaksOutGatewayInstances(t *testing.T) {
 	fake := &filteringAllPgn{readings: twinEngineReadings()}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{AllPGNComponent: "all-pgn", TrackInstances: true}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{AllPGNComponent: "all-pgn", TrackInstances: boolPtr(true)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -155,7 +168,7 @@ func TestTrackInstancesDeviceWithoutClaim(t *testing.T) {
 			"Instance": float64(0), "Voltage": 13.1, "description": "Battery Status",
 		}),
 	}}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: true}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: boolPtr(true)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -184,7 +197,7 @@ func TestTrackInstancesFollowNewestAddress(t *testing.T) {
 			"Instance": float64(1), "description": "Fluid Level",
 		}),
 	}}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: true}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: boolPtr(true)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -198,7 +211,7 @@ func TestTrackInstancesFollowNewestAddress(t *testing.T) {
 // Vesper, ...) with `viam machines part run ... --method GetReadings`.
 func TestTrackInstancesLiveFixture(t *testing.T) {
 	fake := &filteringAllPgn{readings: loadFixture(t, "testdata/all-pgn-live.json")}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: true}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: boolPtr(true)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
@@ -251,7 +264,7 @@ func TestVirtualNodesWithSharedUniqueNumberAreDistinct(t *testing.T) {
 		}),
 		"126996-9": entry(126996, 9, "14 Oct 26 08:52 -0400", map[string]interface{}{"Model ID": "Virtual N2K Input Handler"}),
 	}}
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: true}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: boolPtr(true)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 

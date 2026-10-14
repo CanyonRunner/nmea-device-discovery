@@ -2,7 +2,8 @@
 // without a viam-server, and prints the resulting inventory as JSON.
 //
 //	viam machines part run --part <id> --component all-pgn --method GetReadings > dump.json
-//	go run ./cmd/cli -track-instances dump.json
+//	go run ./cmd/cli dump.json
+//	go run ./cmd/cli -track-instances=false dump.json
 package main
 
 import (
@@ -63,10 +64,10 @@ func main() {
 }
 
 func realMain() error {
-	track := flag.Bool("track-instances", false, "set the track-instances attribute")
+	track := flag.Bool("track-instances", true, "the track-instances attribute (default on)")
 	flag.Parse()
 	if flag.NArg() != 1 {
-		return fmt.Errorf("usage: cli [-track-instances] <all-pgn-readings.json>")
+		return fmt.Errorf("usage: cli [-track-instances=false] <all-pgn-readings.json>")
 	}
 
 	readings, err := loadDump(flag.Arg(0))
@@ -77,7 +78,7 @@ func realMain() error {
 	ctx := context.Background()
 	logger := logging.NewLogger("cli")
 	deps := resource.Dependencies{sensor.Named("all-pgn"): &fileAllPgn{readings: readings}}
-	cfg := nmeadevicediscovery.Config{AllPGNComponent: "all-pgn", TrackInstances: *track}
+	cfg := nmeadevicediscovery.Config{AllPGNComponent: "all-pgn", TrackInstances: track}
 
 	thing, err := nmeadevicediscovery.NewDevicelist(ctx, deps, sensor.Named("devicelist"), &cfg, logger)
 	if err != nil {

@@ -34,9 +34,9 @@ type Config struct {
 	// TrackInstances widens the read to the whole all-pgn history and adds an
 	// "instances" list to each device: one entry per (PGN, instance) the
 	// device transmits, so a gateway reporting two engines or three tanks is
-	// broken out per engine or tank. Off by default; the default read is
-	// filtered down to the three identity PGNs.
-	TrackInstances bool `json:"track-instances,omitempty"`
+	// broken out per engine or tank. On by default; set it to false to push
+	// the identity-PGN filter down to all-pgn and omit the list.
+	TrackInstances *bool `json:"track-instances,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -153,9 +153,11 @@ func asInt(v interface{}) (int, bool) {
 	return 0, false
 }
 
-// trackInstances is nil-safe so tests can build the sensor without a Config.
+// trackInstances reports the effective setting: true unless the config sets
+// "track-instances": false. Nil-safe so tests can build the sensor without a
+// Config.
 func (s *nmeaDeviceDiscoveryDevicelist) trackInstances() bool {
-	return s.cfg != nil && s.cfg.TrackInstances
+	return s.cfg == nil || s.cfg.TrackInstances == nil || *s.cfg.TrackInstances
 }
 
 // instanceSeen is one (PGN, instance) pair a source address transmits, e.g.
