@@ -21,4 +21,4 @@ go run ./cmd/cli dump.json
 
 This module provides the following model(s):
 
-- [`viam-soleng:nmea-device-discovery:devicelist`](viam-soleng_nmea-device-discovery_devicelist.md) - Sensor reporting one entry per NMEA 2000 device seen on the network
+- [`canyonrunner:nmea-device-discovery:devicelist`](canyonrunner_nmea-device-discovery_devicelist.md) - Sensor reporting one entry per NMEA 2000 device seen on the network

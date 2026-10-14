@@ -1,15 +1,15 @@
 {
   "$schema": "https://dl.viam.dev/module.schema.json",
-  "module_id": "viam-soleng:nmea-device-discovery",
-  "visibility": "public_unlisted",
-  "url": "https://github.com/viam-soleng/nmea-device-discovery",
+  "module_id": "canyonrunner:nmea-device-discovery",
+  "visibility": "private",
+  "url": "https://github.com/CanyonRunner/nmea-device-discovery",
   "description": "NMEA 2000 device inventory sensor. Reports every NMEA device seen on the network",
   "models": [
     {
       "api": "rdk:component:sensor",
-      "model": "viam-soleng:nmea-device-discovery:devicelist",
+      "model": "canyonrunner:nmea-device-discovery:devicelist",
       "short_description": "A Viam sensor that inventories NMEA 2000 devices.",
-      "markdown_link": "viam-soleng_nmea-device-discovery_devicelist.md"
+      "markdown_link": "canyonrunner_nmea-device-discovery_devicelist.md"
     }
   ],
   "applications": null,

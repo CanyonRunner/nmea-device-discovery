@@ -1,7 +1,7 @@
 {
   "module_name": "nmea-device-discovery",
-  "visibility": "public_unlisted",
-  "namespace": "viam-soleng",
+  "visibility": "private",
+  "namespace": "canyonrunner",
   "language": "go",
   "resource_type": "component",
   "resource_subtype": "sensor",

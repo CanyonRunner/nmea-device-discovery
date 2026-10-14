@@ -1,4 +1,4 @@
-# Model viam-soleng:nmea-device-discovery:devicelist
+# Model canyonrunner:nmea-device-discovery:devicelist
 
 A sensor that reports an inventory of the devices on an NMEA 2000 network.
 Each reading returns one entry per physical device, merging that device's ISO
@@ -76,7 +76,7 @@ sensor plus this model depending on it:
     {
       "name": "devicelist",
       "api": "rdk:component:sensor",
-      "model": "viam-soleng:nmea-device-discovery:devicelist",
+      "model": "canyonrunner:nmea-device-discovery:devicelist",
       "attributes": { "all-pgn-component": "all-pgn" },
       "depends_on": ["all-pgn"]
     }
