@@ -18,7 +18,7 @@ import (
 )
 
 var (
-	Devicelist       = resource.NewModel("canyonrunner", "nmea-device-discovery", "devicelist")
+	Devicelist       = resource.NewModel("viam-soleng", "nmea-device-discovery", "devicelist")
 	errUnimplemented = errors.New("unimplemented")
 )
 

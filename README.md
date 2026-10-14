@@ -22,4 +22,4 @@ go run ./cmd/cli -data-dir ./state dump.json   # persists state across runs, lik
 
 This module provides the following model(s):
 
-- [`canyonrunner:nmea-device-discovery:devicelist`](canyonrunner_nmea-device-discovery_devicelist.md) - Sensor reporting one entry per NMEA 2000 device seen on the network
+- [`viam-soleng:nmea-device-discovery:devicelist`](viam-soleng_nmea-device-discovery_devicelist.md) - Sensor reporting one entry per NMEA 2000 device seen on the network
