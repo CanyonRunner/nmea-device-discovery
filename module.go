@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,6 +31,12 @@ type Config struct {
 	// AllPGNComponent names the viamboat boat-all-pgn sensor component whose
 	// accumulated bus history this model reshapes into a device inventory.
 	AllPGNComponent string `json:"all-pgn-component"`
+	// TrackInstances widens the read to the whole all-pgn history and adds an
+	// "instances" list to each device: one entry per (PGN, instance) the
+	// device transmits, so a gateway reporting two engines or three tanks is
+	// broken out per engine or tank. Off by default; the default read is
+	// filtered down to the three identity PGNs.
+	TrackInstances bool `json:"track-instances,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -145,25 +153,72 @@ func asInt(v interface{}) (int, bool) {
 	return 0, false
 }
 
+// trackInstances is nil-safe so tests can build the sensor without a Config.
+func (s *nmeaDeviceDiscoveryDevicelist) trackInstances() bool {
+	return s.cfg != nil && s.cfg.TrackInstances
+}
+
+// instanceSeen is one (PGN, instance) pair a source address transmits, e.g.
+// Engine Parameters for engine 1 or Fluid Level for tank 2.
+type instanceSeen struct {
+	pgn, instance int
+	description   string
+	lastSeen      time.Time
+	lastSeenRaw   string
+}
+
+// instanceOf extracts the instance a non-identity entry belongs to. viamboat
+// keys instance-bearing messages "<pgn>-<src>-<instance>"; the decoded
+// payload also carries the field as "Instance". Entries with neither are not
+// instanced (position, heading, ...) and are not reported.
+func instanceOf(key string, entry map[string]interface{}) (int, bool) {
+	if parts := strings.Split(key, "-"); len(parts) == 3 {
+		if n, err := strconv.Atoi(parts[2]); err == nil {
+			return n, true
+		}
+	}
+	return asInt(entry["Instance"])
+}
+
+// parseTimestamp reads the all-pgn timestamp (CANTimeFormat.String(), RFC822Z).
+func parseTimestamp(entry map[string]interface{}) (time.Time, string, bool) {
+	raw, ok := entry["timestamp"].(string)
+	if !ok {
+		return time.Time{}, "", false
+	}
+	ts, err := time.Parse(time.RFC822Z, raw)
+	return ts, raw, err == nil
+}
+
 // Readings returns one entry per device seen on the NMEA 2000 network, built
 // by filtering the all-pgn sensor's accumulated history down to the identity
-// PGNs and merging them per device. Entries are keyed by the device's stable
-// identity (unique number + manufacturer code from its address claim) rather
-// than its source address: addresses move under contention, and keying by
-// address would report ghost devices at stale addresses. Entries are never
-// pruned; last_seen lets the caller decide what is stale.
+// PGNs and merging them per device. Devices are identified by their ISO NAME
+// from the address claim (unique number, manufacturer, device instance and
+// function; see stableIdentity) rather than by source address: addresses
+// move under contention, and keying by address would report ghost devices
+// at stale addresses. Entries are never pruned; last_seen lets the caller
+// decide what is stale.
 func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
-	raw, err := s.allPgn.Readings(ctx, map[string]interface{}{
-		"pgns": []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo},
-	})
+	// By default the filter is pushed down to the all-pgn sensor so only the
+	// identity PGNs cross the hop. Instance tracking needs the whole history:
+	// any PGN may carry an instance, so no fixed list would stay correct.
+	var filter map[string]interface{}
+	if !s.trackInstances() {
+		filter = map[string]interface{}{
+			"pgns": []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo},
+		}
+	}
+	raw, err := s.allPgn.Readings(ctx, filter)
 	if err != nil {
 		return nil, fmt.Errorf("Reading from all-pgn-component: %w", err)
 	}
 
-	// The all-pgn history holds one entry per (PGN, source); group the up to
-	// three identity entries of each source address together.
+	// The all-pgn history holds one entry per (PGN, source[, instance]); group
+	// the up to three identity entries of each source address together, and
+	// when tracking instances, the (PGN, instance) pairs it transmits.
 	perSrc := map[int]map[int]map[string]interface{}{}
-	for _, v := range raw {
+	instancesPerSrc := map[int]map[string]instanceSeen{} // keyed "<pgn>/<instance>"
+	for key, v := range raw {
 		entry, ok := v.(map[string]interface{})
 		if !ok {
 			continue
@@ -173,25 +228,47 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		if !okP || !okS {
 			continue
 		}
+		if _, isIdentity := identityFieldNames[pgn]; isIdentity {
+			if perSrc[src] == nil {
+				perSrc[src] = map[int]map[string]interface{}{}
+			}
+			perSrc[src][pgn] = entry
+			continue
+		}
+		if !s.trackInstances() {
+			continue
+		}
+		instance, ok := instanceOf(key, entry)
+		if !ok {
+			continue
+		}
+		seen := instanceSeen{pgn: pgn, instance: instance}
+		seen.description, _ = entry["description"].(string)
+		seen.lastSeen, seen.lastSeenRaw, _ = parseTimestamp(entry)
+		ik := fmt.Sprintf("%d/%d", pgn, instance)
+		if instancesPerSrc[src] == nil {
+			instancesPerSrc[src] = map[string]instanceSeen{}
+		}
+		if prev, dup := instancesPerSrc[src][ik]; !dup || seen.lastSeen.After(prev.lastSeen) {
+			instancesPerSrc[src][ik] = seen
+		}
+		// A source we only know from instanced data still counts as a device
+		// (keyed by address until its claim is seen).
 		if perSrc[src] == nil {
 			perSrc[src] = map[int]map[string]interface{}{}
 		}
-		perSrc[src][pgn] = entry
 	}
 
 	// Merge each source's entries into one device object and de-duplicate by
 	// stable identity: a device that moved addresses (contention, commanded
 	// address) appears under several sources, and only its most recent
 	// incarnation is kept.
-	type mergedDevice struct {
-		fields   map[string]interface{}
-		lastSeen time.Time
-	}
 	winners := map[string]mergedDevice{} // keyed by stable identity
 	for src, entries := range perSrc {
 		device := map[string]interface{}{"src": src}
 		var lastSeen time.Time
 		lastSeenRaw := ""
+		instanceCount := 0
 		for pgn, entry := range entries {
 			for from, to := range identityFieldNames[pgn] {
 				if val, has := entry[from]; has {
@@ -200,14 +277,47 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 			}
 			// The all-pgn timestamp is CANTimeFormat.String() (RFC822Z);
 			// last_seen is the newest across the merged entries.
-			if tsRaw, ok := entry["timestamp"].(string); ok {
-				if ts, err := time.Parse(time.RFC822Z, tsRaw); err == nil && ts.After(lastSeen) {
-					lastSeen = ts
-					lastSeenRaw = tsRaw
-				} else if err != nil && lastSeenRaw == "" {
-					lastSeenRaw = tsRaw
+			if ts, tsRaw, parsed := parseTimestamp(entry); parsed && ts.After(lastSeen) {
+				lastSeen = ts
+				lastSeenRaw = tsRaw
+			} else if tsRaw != "" && !parsed && lastSeenRaw == "" {
+				lastSeenRaw = tsRaw
+			}
+		}
+		// Instanced data is sent far more often than identity PGNs, so it is
+		// the better liveness signal: a gateway streaming engine data is on
+		// the bus even if its last address claim is hours old.
+		if s.trackInstances() {
+			instances := make([]instanceSeen, 0, len(instancesPerSrc[src]))
+			instanceCount = len(instancesPerSrc[src])
+			for _, inst := range instancesPerSrc[src] {
+				instances = append(instances, inst)
+				if inst.lastSeen.After(lastSeen) {
+					lastSeen = inst.lastSeen
+					lastSeenRaw = inst.lastSeenRaw
 				}
 			}
+			sort.Slice(instances, func(i, j int) bool {
+				if instances[i].pgn != instances[j].pgn {
+					return instances[i].pgn < instances[j].pgn
+				}
+				return instances[i].instance < instances[j].instance
+			})
+			rendered := make([]interface{}, 0, len(instances))
+			for _, inst := range instances {
+				m := map[string]interface{}{
+					"pgn":      inst.pgn,
+					"instance": inst.instance,
+				}
+				if inst.description != "" {
+					m["description"] = inst.description
+				}
+				if inst.lastSeenRaw != "" {
+					m["last_seen"] = inst.lastSeenRaw
+				}
+				rendered = append(rendered, m)
+			}
+			device["instances"] = rendered
 		}
 		if lastSeenRaw != "" {
 			device["last_seen"] = lastSeenRaw
@@ -217,13 +327,14 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		// identity fragments from (no claim yet) is identified by its address.
 		identity := fmt.Sprintf("src-%d", src)
 		if _, has := entries[pgnAddressClaim]; has {
-			identity = fmt.Sprintf("%v-%v", intIfNumeric(device["unique_number"]), intIfNumeric(device["manufacturer_code"]))
+			identity = stableIdentity(device)
 		}
 
-		if prev, seen := winners[identity]; seen && !lastSeen.After(prev.lastSeen) {
+		candidate := mergedDevice{fields: device, src: src, lastSeen: lastSeen, instanceCount: instanceCount}
+		if prev, seen := winners[identity]; seen && !candidate.beats(prev) {
 			continue
 		}
-		winners[identity] = mergedDevice{fields: device, lastSeen: lastSeen}
+		winners[identity] = candidate
 	}
 
 	// Render display keys from the winners: "<manufacturer> <model> [<unique>]"
@@ -231,11 +342,108 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 	// number (or source address for claim-less devices) keeps keys unique when
 	// a network carries several identical products.
 	devices := map[string]interface{}{}
-	for identity, w := range winners {
-		devices[deviceDisplayKey(identity, w.fields)] = w.fields
+	for key, w := range disambiguate(winners) {
+		devices[key] = w.fields
 	}
 
 	return devices, nil
+}
+
+// disambiguate renders display keys for the winners and resolves collisions:
+// distinct devices can share manufacturer, model and unique number (the two
+// halves of a dual gateway differ only by device instance; a plotter's
+// virtual nodes differ by device function). A colliding group gets the
+// shortest qualifier that tells its members apart: " #<device instance>",
+// then also " (<device function>)", then also " (src <n>)".
+func disambiguate(winners map[string]mergedDevice) map[string]mergedDevice {
+	byKey := map[string][]mergedDevice{}
+	for identity, w := range winners {
+		k := deviceDisplayKey(identity, w.fields)
+		byKey[k] = append(byKey[k], w)
+	}
+	qualifiers := []func(mergedDevice) string{
+		func(w mergedDevice) string { return fmt.Sprintf(" #%d", deviceInstance(w.fields)) },
+		func(w mergedDevice) string { return fmt.Sprintf(" (%v)", intIfNumeric(w.fields["device_function"])) },
+		func(w mergedDevice) string { return fmt.Sprintf(" (src %d)", w.src) },
+	}
+	out := map[string]mergedDevice{}
+	for base, group := range byKey {
+		if len(group) == 1 {
+			out[base] = group[0]
+			continue
+		}
+		for level := 1; level <= len(qualifiers); level++ {
+			keys := make([]string, len(group))
+			unique := true
+			seen := map[string]bool{}
+			for i, w := range group {
+				keys[i] = base
+				for _, q := range qualifiers[:level] {
+					keys[i] += q(w)
+				}
+				if seen[keys[i]] {
+					unique = false
+				}
+				seen[keys[i]] = true
+			}
+			if unique || level == len(qualifiers) {
+				for i, w := range group {
+					out[keys[i]] = w
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+// stableIdentity is the device's ISO NAME minus its address: unique number,
+// manufacturer, device instance and device function. Unique number plus
+// manufacturer alone is not unique on a real bus: Garmin MFDs expose several
+// virtual nodes (Display, Button Interface) under one unique number, and an
+// Actisense dual gateway claims two addresses that differ only by device
+// instance. Both are live at once and must be reported separately.
+func stableIdentity(device map[string]interface{}) string {
+	return fmt.Sprintf("%v-%v-%d-%v",
+		intIfNumeric(device["unique_number"]),
+		intIfNumeric(device["manufacturer_code"]),
+		deviceInstance(device),
+		intIfNumeric(device["device_function"]))
+}
+
+// deviceInstance assembles the NMEA 2000 device instance from the two
+// address-claim fields: lower (3 bits) and upper (5 bits).
+func deviceInstance(device map[string]interface{}) int {
+	lower, _ := asInt(device["device_instance_lower"])
+	upper, _ := asInt(device["device_instance_upper"])
+	return lower | upper<<3
+}
+
+// mergedDevice is one source address's merged identity entries, competing
+// with the same device's other addresses for the single reported entry.
+type mergedDevice struct {
+	fields        map[string]interface{}
+	src           int
+	lastSeen      time.Time
+	instanceCount int
+}
+
+// beats decides which address of a device is reported. Newest last_seen
+// wins; the all-pgn timestamps have one-minute resolution, so ties are
+// common and must not fall through to map iteration order. On a tie prefer
+// the address with live instanced traffic, then the more completely
+// described one, then the lower address.
+func (m mergedDevice) beats(prev mergedDevice) bool {
+	if !m.lastSeen.Equal(prev.lastSeen) {
+		return m.lastSeen.After(prev.lastSeen)
+	}
+	if m.instanceCount != prev.instanceCount {
+		return m.instanceCount > prev.instanceCount
+	}
+	if len(m.fields) != len(prev.fields) {
+		return len(m.fields) > len(prev.fields)
+	}
+	return m.src < prev.src
 }
 
 // intIfNumeric normalizes a value to int when it is numeric. Values arrive as
