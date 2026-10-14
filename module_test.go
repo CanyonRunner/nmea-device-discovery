@@ -45,11 +45,11 @@ func TestReadingsMergesIdentityPGNsPerDevice(t *testing.T) {
 		}),
 	}}
 
-	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake, cfg: &Config{TrackInstances: boolPtr(false)}}
 	got, err := s.Readings(context.Background(), nil)
 	test.That(t, err, test.ShouldBeNil)
 
-	// Filter pushed down to the all-pgn sensor.
+	// With instance tracking off, the filter is pushed down to the all-pgn sensor.
 	test.That(t, fake.gotExtra["pgns"], test.ShouldResemble,
 		[]interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo})
 
