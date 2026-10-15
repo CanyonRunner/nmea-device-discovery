@@ -293,22 +293,20 @@ func deviceInstance(device map[string]interface{}) int {
 	return lower | upper<<3
 }
 
-// disambiguate renders display keys for the devices and resolves collisions:
-// distinct devices can share manufacturer, model and unique number (the two
-// halves of a dual gateway differ only by device instance; a plotter's
-// virtual nodes differ by device function). A colliding group gets the
-// shortest qualifier that tells its members apart: " #<device instance>",
-// then also " (<device function>)", then also " (src <n>)".
+// disambiguate renders display keys for the devices and resolves the one
+// collision a device's own fields leave open: two nodes that share
+// manufacturer, model, unique number and device instance but differ by
+// device function, as a plotter's Display and Button Interface nodes do
+// before their product info is seen. Those get " (<device function>)"
+// appended. The device instance is part of the base key (see
+// deviceDisplayKey) rather than a collision qualifier, so a name does not
+// depend on which other devices happen to be on the bus; after a restart,
+// when devices reappear one at a time, each gets the same name as before.
 func disambiguate(devices map[string]mergedDevice) map[string]mergedDevice {
 	byKey := map[string][]mergedDevice{}
 	for identity, m := range devices {
 		k := deviceDisplayKey(identity, m.fields)
 		byKey[k] = append(byKey[k], m)
-	}
-	qualifiers := []func(mergedDevice) string{
-		func(m mergedDevice) string { return fmt.Sprintf(" #%d", deviceInstance(m.fields)) },
-		func(m mergedDevice) string { return fmt.Sprintf(" (%v)", intIfNumeric(m.fields["device_function"])) },
-		func(m mergedDevice) string { return fmt.Sprintf(" (src %d)", m.src) },
 	}
 	out := map[string]mergedDevice{}
 	for base, group := range byKey {
@@ -316,26 +314,8 @@ func disambiguate(devices map[string]mergedDevice) map[string]mergedDevice {
 			out[base] = group[0]
 			continue
 		}
-		for level := 1; level <= len(qualifiers); level++ {
-			keys := make([]string, len(group))
-			unique := true
-			seen := map[string]bool{}
-			for i, m := range group {
-				keys[i] = base
-				for _, q := range qualifiers[:level] {
-					keys[i] += q(m)
-				}
-				if seen[keys[i]] {
-					unique = false
-				}
-				seen[keys[i]] = true
-			}
-			if unique || level == len(qualifiers) {
-				for i, m := range group {
-					out[keys[i]] = m
-				}
-				break
-			}
+		for _, m := range group {
+			out[fmt.Sprintf("%s (%v)", base, fieldOrUnknown(m.fields, "device_function"))] = m
 		}
 	}
 	return out
@@ -367,7 +347,10 @@ func sanitizeLabel(s string) string {
 
 // deviceDisplayKey builds the human-facing map key for a merged device:
 // "<manufacturer> <model> [<unique number>]", with graceful fallbacks when
-// product info or the address claim has not been seen yet.
+// product info or the address claim has not been seen yet. A non-zero
+// device instance is appended as " #<n>": the two halves of a dual gateway
+// claim instance 0 and 1, and the suffix keeps the second half's name the
+// same whether or not the first is currently on the bus.
 func deviceDisplayKey(identity string, device map[string]interface{}) string {
 	label := ""
 	if mfg, has := device["manufacturer_code"]; has {
@@ -387,10 +370,14 @@ func deviceDisplayKey(identity string, device map[string]interface{}) string {
 		suffix = fmt.Sprintf("%d", unique)
 	}
 
-	if label == "" {
-		return suffix
+	key := suffix
+	if label != "" {
+		key = fmt.Sprintf("%s [%s]", label, suffix)
 	}
-	return fmt.Sprintf("%s [%s]", label, suffix)
+	if inst := deviceInstance(device); inst != 0 {
+		key += fmt.Sprintf(" #%d", inst)
+	}
+	return key
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {

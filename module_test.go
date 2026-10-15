@@ -192,10 +192,10 @@ func TestVirtualNodesWithSharedUniqueNumberAreDistinct(t *testing.T) {
 	test.That(t, handler["src"], test.ShouldEqual, 9)
 }
 
-func TestCollidingLabelsGetShortestQualifier(t *testing.T) {
+func TestCollidingLabelsGetFunctionQualifier(t *testing.T) {
 	// Same product, same unique number, no product info yet: the two halves
-	// of a dual gateway differ by device instance, and the two nodes of one
-	// by function.
+	// of a dual gateway differ by device instance (always in the name), and
+	// the two nodes of one half by function (added only on collision).
 	claim := func(src, lower, upper float64, fn string) map[string]interface{} {
 		return entry(60928, src, "14 Oct 26 08:52 -0400", map[string]interface{}{
 			"Unique Number": float64(777), "Manufacturer Code": "Actisense", "Device Function": fn,
@@ -213,15 +213,71 @@ func TestCollidingLabelsGetShortestQualifier(t *testing.T) {
 	test.That(t, err, test.ShouldBeNil)
 
 	// Four claims, three distinct identities (4 and 6 are one device that
-	// moved), told apart by instance, then function.
+	// moved). Instance 0 needs no qualifier; the two instance-1 nodes are
+	// told apart by function.
 	test.That(t, len(got), test.ShouldEqual, 3)
-	_, ok := got["Actisense [777] #0 (PC Gateway)"]
+	_, ok := got["Actisense [777]"]
 	test.That(t, ok, test.ShouldBeTrue)
 	_, ok = got["Actisense [777] #1 (PC Gateway)"]
 	test.That(t, ok, test.ShouldBeTrue)
 	display, ok := got["Actisense [777] #1 (Display)"].(map[string]interface{})
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, display["src"], test.ShouldEqual, 4) // tie on last_seen: lower address wins
+}
+
+func TestNameDoesNotDependOnOtherDevices(t *testing.T) {
+	// After a viamboat restart devices reappear one at a time. A dual
+	// gateway's second half must get the same name alone as it does once
+	// its twin is back, or data capture sees one device under two names.
+	half := func(src, instance float64) map[string]interface{} {
+		return entry(60928, src, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(340545), "Manufacturer Code": "Actisense",
+			"Device Function": "PC Gateway", "Device Instance Lower": instance,
+		})
+	}
+	product := func(src float64) map[string]interface{} {
+		return entry(126996, src, "14 Oct 26 08:52 -0400", map[string]interface{}{"Model ID": "NGX-1: Dual Gateway"})
+	}
+	const second = "Actisense NGX-1: Dual Gateway [340545] #1"
+
+	alone := &fakeAllPgn{readings: map[string]interface{}{"60928-2": half(2, 1), "126996-2": product(2)}}
+	got, err := (&nmeaDeviceDiscoveryDevicelist{allPgn: alone}).Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, len(got), test.ShouldEqual, 1)
+	_, ok := got[second]
+	test.That(t, ok, test.ShouldBeTrue)
+
+	both := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-0": half(0, 0), "126996-0": product(0),
+		"60928-2": half(2, 1), "126996-2": product(2),
+	}}
+	got, err = (&nmeaDeviceDiscoveryDevicelist{allPgn: both}).Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, len(got), test.ShouldEqual, 2)
+	_, ok = got[second]
+	test.That(t, ok, test.ShouldBeTrue)
+	_, ok = got["Actisense NGX-1: Dual Gateway [340545]"]
+	test.That(t, ok, test.ShouldBeTrue)
+}
+
+func TestMissingFunctionQualifierReadsUnknown(t *testing.T) {
+	// Two nodes that collide on label and instance, one with a function the
+	// decoder dropped: the qualifier must not render as "()".
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-5": entry(60928, 5, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(99), "Manufacturer Code": "Garmin", "Device Function": "Display",
+		}),
+		"60928-6": entry(60928, 6, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(99), "Manufacturer Code": "Garmin",
+		}),
+	}}
+	got, err := (&nmeaDeviceDiscoveryDevicelist{allPgn: fake}).Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+	test.That(t, len(got), test.ShouldEqual, 2)
+	_, ok := got["Garmin [99] (Display)"]
+	test.That(t, ok, test.ShouldBeTrue)
+	_, ok = got["Garmin [99] (unknown)"]
+	test.That(t, ok, test.ShouldBeTrue)
 }
 
 func TestTieOnLastSeenPrefersMoreCompleteAddress(t *testing.T) {

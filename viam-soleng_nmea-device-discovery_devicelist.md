@@ -11,11 +11,12 @@ Entries are keyed by a human-readable device label,
 from the address claim (unique number, manufacturer, device instance and
 device function), not by bus address — NMEA 2000 addresses can move when
 devices contend, and a device that changed address is reported once, at its
-newest address. Distinct devices can share a label: a dual gateway claims
-two addresses that differ only by device instance, and a plotter's virtual
-nodes differ by device function. Such a group gets the shortest qualifier
-that tells its members apart, `... #<device instance>`, then
-`... (<device function>)`, then `... (src <n>)`. Entries are never pruned:
+newest address. A device with a non-zero device instance carries it in its
+label as `... #<device instance>`, so the two halves of a dual gateway are
+`... [340545]` and `... [340545] #1` whether or not both are currently on
+the bus. Devices that still share a label and differ only by device
+function (a plotter's virtual nodes, before their product info is seen) get
+`... (<device function>)`. Entries are never pruned:
 use the `last_seen` timestamp to decide what counts as stale for your
 application. A device heard from only partially (for example, product info
 without an address claim) is keyed by its source address as `... [src-<n>]`
