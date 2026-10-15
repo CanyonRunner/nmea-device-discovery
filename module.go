@@ -147,11 +147,12 @@ func asInt(v interface{}) (int, bool) {
 
 // Readings returns one entry per device seen on the NMEA 2000 network, built
 // by filtering the all-pgn sensor's accumulated history down to the identity
-// PGNs and merging them per device. Entries are keyed by the device's stable
-// identity (unique number + manufacturer code from its address claim) rather
-// than its source address: addresses move under contention, and keying by
-// address would report ghost devices at stale addresses. Entries are never
-// pruned; last_seen lets the caller decide what is stale.
+// PGNs and merging them per device. Devices are identified by their ISO NAME
+// from the address claim (unique number, manufacturer, device instance and
+// device function; see stableIdentity) rather than by source address:
+// addresses move under contention, and keying by address would report ghost
+// devices at stale addresses. Entries are never pruned; last_seen lets the
+// caller decide what is stale.
 func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
 	raw, err := s.allPgn.Readings(ctx, map[string]interface{}{
 		"pgns": []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo},
@@ -179,63 +180,165 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 		perSrc[src][pgn] = entry
 	}
 
-	// Merge each source's entries into one device object and de-duplicate by
-	// stable identity: a device that moved addresses (contention, commanded
-	// address) appears under several sources, and only its most recent
-	// incarnation is kept.
-	type mergedDevice struct {
-		fields   map[string]interface{}
-		lastSeen time.Time
-	}
+	// Merge each source's entries into one device and de-duplicate by stable
+	// identity: a device that moved addresses (contention, commanded address)
+	// appears under several sources, and only its most recent incarnation is
+	// kept.
 	winners := map[string]mergedDevice{} // keyed by stable identity
 	for src, entries := range perSrc {
-		device := map[string]interface{}{"src": src}
-		var lastSeen time.Time
-		lastSeenRaw := ""
+		m := mergedDevice{src: src, fields: map[string]interface{}{"src": src}}
 		for pgn, entry := range entries {
 			for from, to := range identityFieldNames[pgn] {
 				if val, has := entry[from]; has {
-					device[to] = val
+					m.fields[to] = val
 				}
 			}
 			// The all-pgn timestamp is CANTimeFormat.String() (RFC822Z);
 			// last_seen is the newest across the merged entries.
 			if tsRaw, ok := entry["timestamp"].(string); ok {
-				if ts, err := time.Parse(time.RFC822Z, tsRaw); err == nil && ts.After(lastSeen) {
-					lastSeen = ts
-					lastSeenRaw = tsRaw
-				} else if err != nil && lastSeenRaw == "" {
-					lastSeenRaw = tsRaw
+				if ts, err := time.Parse(time.RFC822Z, tsRaw); err == nil && ts.After(m.lastSeen) {
+					m.lastSeen = ts
+					m.lastSeenRaw = tsRaw
+				} else if err != nil && m.lastSeenRaw == "" {
+					m.lastSeenRaw = tsRaw
 				}
 			}
 		}
-		if lastSeenRaw != "" {
-			device["last_seen"] = lastSeenRaw
+		if m.lastSeenRaw != "" {
+			m.fields["last_seen"] = m.lastSeenRaw
 		}
 
 		// Stable identity from the address claim; a device we have only seen
 		// identity fragments from (no claim yet) is identified by its address.
 		identity := fmt.Sprintf("src-%d", src)
 		if _, has := entries[pgnAddressClaim]; has {
-			identity = fmt.Sprintf("%v-%v", intIfNumeric(device["unique_number"]), intIfNumeric(device["manufacturer_code"]))
+			identity = stableIdentity(m.fields)
 		}
 
-		if prev, seen := winners[identity]; seen && !lastSeen.After(prev.lastSeen) {
+		if prev, seen := winners[identity]; seen && !m.beats(prev) {
 			continue
 		}
-		winners[identity] = mergedDevice{fields: device, lastSeen: lastSeen}
+		winners[identity] = m
 	}
 
 	// Render display keys from the winners: "<manufacturer> <model> [<unique>]"
 	// reads like a device name in the Viam app, while the bracketed unique
 	// number (or source address for claim-less devices) keeps keys unique when
-	// a network carries several identical products.
+	// a network carries several identical products. Distinct devices that
+	// still share a label are told apart by disambiguate.
 	devices := map[string]interface{}{}
-	for identity, w := range winners {
-		devices[deviceDisplayKey(identity, w.fields)] = w.fields
+	for key, m := range disambiguate(winners) {
+		devices[key] = m.fields
 	}
 
 	return devices, nil
+}
+
+// mergedDevice is one device: its identity fields merged from the identity
+// PGNs, the address it was heard at, and when it was last seen there.
+type mergedDevice struct {
+	fields      map[string]interface{}
+	src         int
+	lastSeen    time.Time
+	lastSeenRaw string
+}
+
+// beats decides which address of a device is reported when the history
+// holds it at several. Newest last_seen wins; the all-pgn timestamps have
+// one-minute resolution, so ties are common and must not fall through to
+// map iteration order. On a tie prefer the more completely described
+// address, then the lower one.
+func (m mergedDevice) beats(prev mergedDevice) bool {
+	if !m.lastSeen.Equal(prev.lastSeen) {
+		return m.lastSeen.After(prev.lastSeen)
+	}
+	if len(m.fields) != len(prev.fields) {
+		return len(m.fields) > len(prev.fields)
+	}
+	return m.src < prev.src
+}
+
+// stableIdentity is the device's ISO NAME minus its address: unique number,
+// manufacturer, device instance and device function. Unique number plus
+// manufacturer alone is not unique on a real bus: Garmin MFDs expose several
+// virtual nodes (Display, Button Interface) under one unique number, and an
+// Actisense dual gateway claims two addresses that differ only by device
+// instance. Both are live at once and must be reported separately.
+//
+// The decoder drops the manufacturer code (and can drop the function) when
+// the value is not in its lookup table, as with an unregistered code such as
+// the 2046 placeholder from the open-source NMEA2000 library. Those slots
+// read "unknown" rather than "<nil>" so the key stays legible and stable.
+func stableIdentity(device map[string]interface{}) string {
+	return fmt.Sprintf("%v-%v-%d-%v",
+		intIfNumeric(device["unique_number"]),
+		fieldOrUnknown(device, "manufacturer_code"),
+		deviceInstance(device),
+		fieldOrUnknown(device, "device_function"))
+}
+
+func fieldOrUnknown(device map[string]interface{}, key string) interface{} {
+	v, has := device[key]
+	if !has || v == nil || v == "" {
+		return "unknown"
+	}
+	return intIfNumeric(v)
+}
+
+// deviceInstance assembles the NMEA 2000 device instance from the two
+// address-claim fields: lower (3 bits) and upper (5 bits).
+func deviceInstance(device map[string]interface{}) int {
+	lower, _ := asInt(device["device_instance_lower"])
+	upper, _ := asInt(device["device_instance_upper"])
+	return lower | upper<<3
+}
+
+// disambiguate renders display keys for the devices and resolves collisions:
+// distinct devices can share manufacturer, model and unique number (the two
+// halves of a dual gateway differ only by device instance; a plotter's
+// virtual nodes differ by device function). A colliding group gets the
+// shortest qualifier that tells its members apart: " #<device instance>",
+// then also " (<device function>)", then also " (src <n>)".
+func disambiguate(devices map[string]mergedDevice) map[string]mergedDevice {
+	byKey := map[string][]mergedDevice{}
+	for identity, m := range devices {
+		k := deviceDisplayKey(identity, m.fields)
+		byKey[k] = append(byKey[k], m)
+	}
+	qualifiers := []func(mergedDevice) string{
+		func(m mergedDevice) string { return fmt.Sprintf(" #%d", deviceInstance(m.fields)) },
+		func(m mergedDevice) string { return fmt.Sprintf(" (%v)", intIfNumeric(m.fields["device_function"])) },
+		func(m mergedDevice) string { return fmt.Sprintf(" (src %d)", m.src) },
+	}
+	out := map[string]mergedDevice{}
+	for base, group := range byKey {
+		if len(group) == 1 {
+			out[base] = group[0]
+			continue
+		}
+		for level := 1; level <= len(qualifiers); level++ {
+			keys := make([]string, len(group))
+			unique := true
+			seen := map[string]bool{}
+			for i, m := range group {
+				keys[i] = base
+				for _, q := range qualifiers[:level] {
+					keys[i] += q(m)
+				}
+				if seen[keys[i]] {
+					unique = false
+				}
+				seen[keys[i]] = true
+			}
+			if unique || level == len(qualifiers) {
+				for i, m := range group {
+					out[keys[i]] = m
+				}
+				break
+			}
+		}
+	}
+	return out
 }
 
 // intIfNumeric normalizes a value to int when it is numeric. Values arrive as

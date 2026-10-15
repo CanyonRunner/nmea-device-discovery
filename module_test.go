@@ -164,3 +164,115 @@ func TestReadingsDeviceWithoutClaimKeyedByAddress(t *testing.T) {
 	test.That(t, ok, test.ShouldBeTrue)
 	test.That(t, dev["model_id"], test.ShouldEqual, "Mystery Box")
 }
+
+func TestVirtualNodesWithSharedUniqueNumberAreDistinct(t *testing.T) {
+	// A Garmin plotter exposes a Display node and a Button Interface node
+	// under the same unique number, both live at once. Neither may hide the
+	// other: they differ only by device function.
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-17": entry(60928, 17, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(474370), "Manufacturer Code": "Garmin", "Device Function": "Display",
+		}),
+		"126996-17": entry(126996, 17, "14 Oct 26 08:52 -0400", map[string]interface{}{"Model ID": "GPSMAP 9500"}),
+		"60928-9": entry(60928, 9, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(474370), "Manufacturer Code": "Garmin", "Device Function": "Button Interface",
+		}),
+		"126996-9": entry(126996, 9, "14 Oct 26 08:52 -0400", map[string]interface{}{"Model ID": "Virtual N2K Input Handler"}),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, len(got), test.ShouldEqual, 2)
+	display, ok := got["Garmin GPSMAP 9500 [474370]"].(map[string]interface{})
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, display["src"], test.ShouldEqual, 17)
+	handler, ok := got["Garmin Virtual N2K Input Handler [474370]"].(map[string]interface{})
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, handler["src"], test.ShouldEqual, 9)
+}
+
+func TestCollidingLabelsGetShortestQualifier(t *testing.T) {
+	// Same product, same unique number, no product info yet: the two halves
+	// of a dual gateway differ by device instance, and the two nodes of one
+	// by function.
+	claim := func(src, lower, upper float64, fn string) map[string]interface{} {
+		return entry(60928, src, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(777), "Manufacturer Code": "Actisense", "Device Function": fn,
+			"Device Instance Lower": lower, "Device Instance Upper": upper,
+		})
+	}
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-0": claim(0, 0, 0, "PC Gateway"),
+		"60928-2": claim(2, 1, 0, "PC Gateway"),
+		"60928-4": claim(4, 1, 0, "Display"),
+		"60928-6": claim(6, 1, 0, "Display"),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	// Four claims, three distinct identities (4 and 6 are one device that
+	// moved), told apart by instance, then function.
+	test.That(t, len(got), test.ShouldEqual, 3)
+	_, ok := got["Actisense [777] #0 (PC Gateway)"]
+	test.That(t, ok, test.ShouldBeTrue)
+	_, ok = got["Actisense [777] #1 (PC Gateway)"]
+	test.That(t, ok, test.ShouldBeTrue)
+	display, ok := got["Actisense [777] #1 (Display)"].(map[string]interface{})
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, display["src"], test.ShouldEqual, 4) // tie on last_seen: lower address wins
+}
+
+func TestTieOnLastSeenPrefersMoreCompleteAddress(t *testing.T) {
+	// all-pgn timestamps have one-minute resolution, so a device that moved
+	// can show the same last_seen at both addresses. The choice must not
+	// depend on map order: the address with more identity data wins.
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-4": entry(60928, 4, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(555), "Manufacturer Code": "Furuno",
+		}),
+		"60928-6": entry(60928, 6, "14 Oct 26 08:52 -0400", map[string]interface{}{
+			"Unique Number": float64(555), "Manufacturer Code": "Furuno",
+		}),
+		"126996-6": entry(126996, 6, "14 Oct 26 08:52 -0400", map[string]interface{}{"Model ID": "TZT14"}),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	for i := 0; i < 20; i++ {
+		got, err := s.Readings(context.Background(), nil)
+		test.That(t, err, test.ShouldBeNil)
+		test.That(t, len(got), test.ShouldEqual, 1)
+		dev, ok := got["Furuno TZT14 [555]"].(map[string]interface{})
+		test.That(t, ok, test.ShouldBeTrue)
+		test.That(t, dev["src"], test.ShouldEqual, 6)
+	}
+}
+
+func TestUnregisteredManufacturerGetsUnknownInIdentity(t *testing.T) {
+	// A box claiming an unregistered manufacturer code (e.g. the NMEA2000
+	// library's 2046 placeholder): the decoder drops the field entirely. Two
+	// such boxes must stay distinct, and the key must not read "<nil>".
+	claim := func(src, unique float64, fn string) map[string]interface{} {
+		return entry(60928, src, "12 Oct 26 13:45 -0400", map[string]interface{}{
+			"Unique Number": unique, "Device Function": fn, "Device Class": "Internetwork device",
+		})
+	}
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-80":  claim(80, 74565, "PC Gateway"),
+		"126996-80": entry(126996, 80, "12 Oct 26 13:44 -0400", map[string]interface{}{"Model ID": "CR Alert Test", "Model Serial Code": "CR0001"}),
+		"60928-81":  claim(81, 74566, "Ownship Position (Loran C)"),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, len(got), test.ShouldEqual, 2)
+	_, ok := got["CR Alert Test [74565]"]
+	test.That(t, ok, test.ShouldBeTrue)
+	_, ok = got["74566"]
+	test.That(t, ok, test.ShouldBeTrue)
+
+	dev := map[string]interface{}{"unique_number": float64(74565), "device_function": "PC Gateway"}
+	test.That(t, stableIdentity(dev), test.ShouldEqual, "74565-unknown-0-PC Gateway")
+	test.That(t, stableIdentity(map[string]interface{}{"unique_number": float64(7)}), test.ShouldEqual, "7-unknown-0-unknown")
+}
