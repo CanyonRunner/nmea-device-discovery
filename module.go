@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	sensor "go.viam.com/rdk/components/sensor"
@@ -29,6 +32,9 @@ type Config struct {
 	// AllPGNComponent names the viamboat boat-all-pgn sensor component whose
 	// accumulated bus history this model reshapes into a device inventory.
 	AllPGNComponent string `json:"all-pgn-component"`
+	// Persist keeps a JSON file under VIAM_MODULE_DATA so first_seen survives
+	// restarts and devices that left the bus stay listed. On by default.
+	Persist *bool `json:"persist,omitempty"`
 }
 
 // Validate ensures all parts of the config are valid and important fields exist.
@@ -54,8 +60,14 @@ type nmeaDeviceDiscoveryDevicelist struct {
 
 	// allPgn is the viamboat boat-all-pgn sensor this model reads through. It
 	// holds the bus history (latest message per PGN and source, with
-	// timestamps); this model keeps no state of its own.
+	// timestamps) since viamboat last started.
 	allPgn sensor.Sensor
+
+	// state is what this model remembers across restarts (see state.go);
+	// statePath is "" when persistence is off or VIAM_MODULE_DATA is unset.
+	mu        sync.Mutex
+	state     *persistedState
+	statePath string
 
 	cancelCtx  context.Context
 	cancelFunc func()
@@ -84,10 +96,32 @@ func NewDevicelist(ctx context.Context, deps resource.Dependencies, name resourc
 		logger:     logger,
 		cfg:        conf,
 		allPgn:     allPgn,
+		state:      newState(),
 		cancelCtx:  cancelCtx,
 		cancelFunc: cancelFunc,
 	}
+
+	if s.persist() {
+		if dir := os.Getenv("VIAM_MODULE_DATA"); dir != "" {
+			s.statePath = filepath.Join(dir, name.ShortName()+"-devices.json")
+			if st, err := loadState(s.statePath); err != nil {
+				logger.Warnw("could not load persisted devices; starting empty", "path", s.statePath, "error", err)
+			} else {
+				s.state = st
+				if n := len(st.Devices); n > 0 {
+					logger.Infow("loaded persisted devices", "path", s.statePath, "devices", n)
+				}
+			}
+		} else {
+			logger.Warn("VIAM_MODULE_DATA is not set; first_seen and offline devices will not survive restarts")
+		}
+	}
 	return s, nil
+}
+
+// persist reports the effective setting: true unless "persist": false.
+func (s *nmeaDeviceDiscoveryDevicelist) persist() bool {
+	return s.cfg == nil || s.cfg.Persist == nil || *s.cfg.Persist
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) Name() resource.Name {
@@ -145,15 +179,49 @@ func asInt(v interface{}) (int, bool) {
 	return 0, false
 }
 
-// Readings returns one entry per device seen on the NMEA 2000 network, built
-// by filtering the all-pgn sensor's accumulated history down to the identity
-// PGNs and merging them per device. Devices are identified by their ISO NAME
-// from the address claim (unique number, manufacturer, device instance and
-// device function; see stableIdentity) rather than by source address:
-// addresses move under contention, and keying by address would report ghost
-// devices at stale addresses. Entries are never pruned; last_seen lets the
-// caller decide what is stale.
+// Readings returns one entry per device seen on the NMEA 2000 network: the
+// devices in the all-pgn sensor's current history, merged per device from
+// the identity PGNs, plus the devices remembered in the state file that the
+// bus has not heard from since viamboat restarted. Devices are identified by
+// their ISO NAME from the address claim (unique number, manufacturer, device
+// instance and device function; see stableIdentity) rather than by source
+// address: addresses move under contention, and keying by address would
+// report ghost devices at stale addresses. Entries are never pruned;
+// first_seen and last_seen let the caller decide what is new or stale.
 func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[string]interface{}) (map[string]interface{}, error) {
+	live, err := s.liveDevices(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	if s.state == nil {
+		s.state = newState()
+	}
+	merged, changed := s.state.merge(live, time.Now())
+	if changed && s.statePath != "" {
+		if err := s.state.save(s.statePath); err != nil {
+			s.logger.Warnw("could not persist devices", "path", s.statePath, "error", err)
+		}
+	}
+	s.mu.Unlock()
+
+	// Render display keys: "<manufacturer> <model> [<unique>]" reads like a
+	// device name in the Viam app, while the bracketed unique number (or
+	// source address for claim-less devices) keeps keys unique when a network
+	// carries several identical products. Distinct devices that still share
+	// a label are told apart by disambiguate.
+	devices := map[string]interface{}{}
+	for key, m := range disambiguate(merged) {
+		devices[key] = m.render()
+	}
+	return devices, nil
+}
+
+// liveDevices filters the all-pgn history down to the identity PGNs and
+// merges them into one mergedDevice per stable identity, keyed by that
+// identity.
+func (s *nmeaDeviceDiscoveryDevicelist) liveDevices(ctx context.Context) (map[string]mergedDevice, error) {
 	raw, err := s.allPgn.Readings(ctx, map[string]interface{}{
 		"pgns": []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo},
 	})
@@ -184,9 +252,9 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 	// identity: a device that moved addresses (contention, commanded address)
 	// appears under several sources, and only its most recent incarnation is
 	// kept.
-	winners := map[string]mergedDevice{} // keyed by stable identity
+	winners := map[string]mergedDevice{}
 	for src, entries := range perSrc {
-		m := mergedDevice{src: src, fields: map[string]interface{}{"src": src}}
+		m := mergedDevice{src: src, fields: map[string]interface{}{}}
 		for pgn, entry := range entries {
 			for from, to := range identityFieldNames[pgn] {
 				if val, has := entry[from]; has {
@@ -194,53 +262,83 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 				}
 			}
 			// The all-pgn timestamp is CANTimeFormat.String() (RFC822Z);
-			// last_seen is the newest across the merged entries.
-			if tsRaw, ok := entry["timestamp"].(string); ok {
-				if ts, err := time.Parse(time.RFC822Z, tsRaw); err == nil && ts.After(m.lastSeen) {
-					m.lastSeen = ts
-					m.lastSeenRaw = tsRaw
-				} else if err != nil && m.lastSeenRaw == "" {
-					m.lastSeenRaw = tsRaw
-				}
+			// last_seen is the newest across the merged entries, first_seen
+			// (before the state file has a say) the oldest.
+			ts, tsRaw, parsed := parseTimestamp(entry)
+			if parsed {
+				m.noteSeen(ts, tsRaw)
+			} else if tsRaw != "" && m.lastSeenRaw == "" {
+				m.lastSeenRaw = tsRaw
 			}
-		}
-		if m.lastSeenRaw != "" {
-			m.fields["last_seen"] = m.lastSeenRaw
 		}
 
 		// Stable identity from the address claim; a device we have only seen
 		// identity fragments from (no claim yet) is identified by its address.
-		identity := fmt.Sprintf("src-%d", src)
-		if _, has := entries[pgnAddressClaim]; has {
-			identity = stableIdentity(m.fields)
+		_, m.hasClaim = entries[pgnAddressClaim]
+		m.identity = fmt.Sprintf("src-%d", src)
+		if m.hasClaim {
+			m.identity = stableIdentity(m.fields)
 		}
 
-		if prev, seen := winners[identity]; seen && !m.beats(prev) {
+		if prev, seen := winners[m.identity]; seen && !m.beats(prev) {
 			continue
 		}
-		winners[identity] = m
+		winners[m.identity] = m
 	}
+	return winners, nil
+}
 
-	// Render display keys from the winners: "<manufacturer> <model> [<unique>]"
-	// reads like a device name in the Viam app, while the bracketed unique
-	// number (or source address for claim-less devices) keeps keys unique when
-	// a network carries several identical products. Distinct devices that
-	// still share a label are told apart by disambiguate.
-	devices := map[string]interface{}{}
-	for key, m := range disambiguate(winners) {
-		devices[key] = m.fields
+// parseTimestamp reads an all-pgn entry's timestamp. The raw string is
+// returned even when it does not parse, so it can still be reported.
+func parseTimestamp(entry map[string]interface{}) (time.Time, string, bool) {
+	raw, _ := entry["timestamp"].(string)
+	if raw == "" {
+		return time.Time{}, "", false
 	}
-
-	return devices, nil
+	ts, err := time.Parse(time.RFC822Z, raw)
+	return ts, raw, err == nil
 }
 
 // mergedDevice is one device: its identity fields merged from the identity
-// PGNs, the address it was heard at, and when it was last seen there.
+// PGNs, the address it was last heard at, and when it was first and last
+// seen.
 type mergedDevice struct {
-	fields      map[string]interface{}
-	src         int
-	lastSeen    time.Time
-	lastSeenRaw string
+	identity string
+	hasClaim bool
+	// fields holds the snake_case identity fields; src, first_seen and
+	// last_seen are rendered from the other members.
+	fields       map[string]interface{}
+	src          int
+	firstSeen    time.Time
+	firstSeenRaw string
+	lastSeen     time.Time
+	lastSeenRaw  string
+}
+
+// noteSeen widens the first/last seen window by one bus timestamp.
+func (m *mergedDevice) noteSeen(ts time.Time, raw string) {
+	if m.lastSeenRaw == "" || ts.After(m.lastSeen) {
+		m.lastSeen, m.lastSeenRaw = ts, raw
+	}
+	if m.firstSeenRaw == "" || ts.Before(m.firstSeen) {
+		m.firstSeen, m.firstSeenRaw = ts, raw
+	}
+}
+
+// render produces the reading entry for the device.
+func (m mergedDevice) render() map[string]interface{} {
+	out := make(map[string]interface{}, len(m.fields)+3)
+	for k, v := range m.fields {
+		out[k] = v
+	}
+	out["src"] = m.src
+	if m.firstSeenRaw != "" {
+		out["first_seen"] = m.firstSeenRaw
+	}
+	if m.lastSeenRaw != "" {
+		out["last_seen"] = m.lastSeenRaw
+	}
+	return out
 }
 
 // beats decides which address of a device is reported when the history
@@ -380,8 +478,81 @@ func deviceDisplayKey(identity string, device map[string]interface{}) string {
 	return key
 }
 
+// DoCommand supports:
+//
+//	{"command": "devices"}                   same as Readings
+//	{"command": "forget", "device": "<key>"} drop one remembered device, by its
+//	                                         reading key (or "identity")
+//	{"command": "reset"}                     forget every remembered device
+//	{"command": "status"}                    persistence settings and counts
 func (s *nmeaDeviceDiscoveryDevicelist) DoCommand(ctx context.Context, cmd map[string]interface{}) (map[string]interface{}, error) {
-	return nil, fmt.Errorf("not implemented")
+	command, _ := cmd["command"].(string)
+	switch command {
+	case "", "devices":
+		return s.Readings(ctx, nil)
+
+	case "forget":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.state == nil {
+			s.state = newState()
+		}
+		identity, _ := cmd["identity"].(string)
+		if key, ok := cmd["device"].(string); ok && identity == "" {
+			remembered := map[string]mergedDevice{}
+			for id, p := range s.state.Devices {
+				remembered[id] = fromPersisted(id, p)
+			}
+			for k, m := range disambiguate(remembered) {
+				if k == key {
+					identity = m.identity
+				}
+			}
+			if identity == "" {
+				return nil, fmt.Errorf("no remembered device %q", key)
+			}
+		}
+		if identity == "" {
+			return nil, errors.New("forget needs \"device\" (reading key) or \"identity\"")
+		}
+		if !s.state.forget(identity) {
+			return nil, fmt.Errorf("no remembered device with identity %q", identity)
+		}
+		return map[string]interface{}{"forgotten": identity}, s.saveLocked()
+
+	case "reset":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.state = newState()
+		if s.statePath != "" {
+			if err := os.Remove(s.statePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		return map[string]interface{}{"reset": true}, nil
+
+	case "status":
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		n := 0
+		if s.state != nil {
+			n = len(s.state.Devices)
+		}
+		return map[string]interface{}{
+			"persist":            s.persist(),
+			"persist_path":       s.statePath,
+			"remembered_devices": n,
+		}, nil
+	}
+	return nil, fmt.Errorf("unknown command %q", command)
+}
+
+// saveLocked persists the state if a path is configured. Caller holds s.mu.
+func (s *nmeaDeviceDiscoveryDevicelist) saveLocked() error {
+	if s.statePath == "" {
+		return nil
+	}
+	return s.state.save(s.statePath)
 }
 
 func (s *nmeaDeviceDiscoveryDevicelist) Status(ctx context.Context) (map[string]interface{}, error) {
