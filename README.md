@@ -1,6 +1,6 @@
 # Module nmea-device-discovery
 
-Inventories the devices on an NMEA 2000 network. The module watches the device-identity PGNs — ISO Address Claim (60928), Product Information (126996), and Configuration Information (126998) — and reports one entry per physical device with its manufacturer, model, serial, installation details, current source address, and a last-seen timestamp.
+Inventories the devices on an NMEA 2000 network. The module watches the device-identity PGNs — ISO Address Claim (60928), Product Information (126996), and Configuration Information (126998) — plus Heartbeat (126993) for liveness, and reports one entry per physical device with its manufacturer, model, serial, installation details, current source address, and a last-seen timestamp.
 
 It is an analyzer/inventory tool for chart plotters, sensors, gateways, and other nodes on the bus: query it every few minutes to see what is on the network and when each device was first and last heard from. It remembers devices across restarts in the module's data directory, so the list is everything the boat has ever had on the bus, not just what has spoken since the last power-up.
 

@@ -51,7 +51,7 @@ func TestReadingsMergesIdentityPGNsPerDevice(t *testing.T) {
 
 	// Filter pushed down to the all-pgn sensor.
 	test.That(t, fake.gotExtra["pgns"], test.ShouldResemble,
-		[]interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo})
+		[]interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo, pgnHeartbeat})
 
 	// One device, labeled "<mfg> <model> [<unique number>]".
 	test.That(t, len(got), test.ShouldEqual, 1)
@@ -331,4 +331,35 @@ func TestUnregisteredManufacturerGetsUnknownInIdentity(t *testing.T) {
 	dev := map[string]interface{}{"unique_number": float64(74565), "device_function": "PC Gateway"}
 	test.That(t, stableIdentity(dev), test.ShouldEqual, "74565-unknown-0-PC Gateway")
 	test.That(t, stableIdentity(map[string]interface{}{"unique_number": float64(7)}), test.ShouldEqual, "7-unknown-0-unknown")
+}
+
+func TestHeartbeatKeepsLastSeenCurrent(t *testing.T) {
+	// A plotter claimed its address when viamboat started three weeks ago
+	// and has sent position every second since, but no identity PGN. Its
+	// heartbeat, sent every minute, is what shows it is still on the bus.
+	fake := &fakeAllPgn{readings: map[string]interface{}{
+		"60928-3": entry(60928, 3, "24 Sep 26 16:13 -0400", map[string]interface{}{
+			"Unique Number": float64(1037921), "Manufacturer Code": "Garmin", "Device Function": "Display",
+		}),
+		"126993-3": entry(126993, 3, "15 Oct 26 12:24 -0400", map[string]interface{}{
+			"Data transmit offset": float64(60000), "Sequence Counter": float64(17),
+		}),
+		// Something at address 9 is alive but has never been identified:
+		// not a device until its claim is seen.
+		"126993-9": entry(126993, 9, "15 Oct 26 12:24 -0400", map[string]interface{}{
+			"Data transmit offset": float64(60000), "Sequence Counter": float64(3),
+		}),
+	}}
+	s := &nmeaDeviceDiscoveryDevicelist{allPgn: fake}
+	got, err := s.Readings(context.Background(), nil)
+	test.That(t, err, test.ShouldBeNil)
+
+	test.That(t, len(got), test.ShouldEqual, 1)
+	dev, ok := got["Garmin [1037921]"].(map[string]interface{})
+	test.That(t, ok, test.ShouldBeTrue)
+	test.That(t, dev["first_seen"], test.ShouldEqual, "24 Sep 26 16:13 -0400")
+	test.That(t, dev["last_seen"], test.ShouldEqual, "15 Oct 26 12:24 -0400")
+	// The heartbeat's own fields are not part of the device.
+	_, leaked := dev["sequence_counter"]
+	test.That(t, leaked, test.ShouldBeFalse)
 }

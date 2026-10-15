@@ -3,7 +3,8 @@
 A sensor that reports an inventory of the devices on an NMEA 2000 network.
 Each reading returns one entry per physical device, merging that device's ISO
 Address Claim (PGN 60928), Product Information (PGN 126996), and Configuration
-Information (PGN 126998) into a single object.
+Information (PGN 126998) into a single object. Heartbeat (PGN 126993) is read
+as well, only for its timestamp.
 
 Entries are keyed by a human-readable device label,
 `<manufacturer> <model> [<unique number>]` (for example
@@ -118,6 +119,14 @@ names ("Garmin"); unknown codes stay numeric. Key labels are sanitized
 (fixed-length model strings are NUL-terminated with junk beyond the
 terminator on some devices), but the `model_id` field keeps the raw decoded
 value. `last_seen` has one-minute resolution.
+
+`last_seen` is the newest timestamp among the device's identity messages and
+its Heartbeat. Devices only send their identity messages at power-up or on
+request, so on their own they would date a live device to the last viamboat
+restart. Devices built to NMEA 2000 v2.0 or later send Heartbeat every 60
+seconds, which keeps `last_seen` current while they are on the bus; older
+devices that send no Heartbeat only move `last_seen` when they re-claim
+their address.
 
 ### first_seen
 

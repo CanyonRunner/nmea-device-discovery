@@ -128,12 +128,22 @@ func (s *nmeaDeviceDiscoveryDevicelist) Name() resource.Name {
 	return s.name
 }
 
-// The NMEA 2000 device-identity PGNs this model reshapes into an inventory.
+// The NMEA 2000 device-identity PGNs this model reshapes into an inventory,
+// plus Heartbeat, read only for its timestamp.
 const (
 	pgnAddressClaim = 60928  // ISO Address Claim: NAME fields, source address
 	pgnProductInfo  = 126996 // Product Information
 	pgnConfigInfo   = 126998 // Configuration Information
+	// Heartbeat is sent every 60 s by devices built to NMEA 2000 v2.0 or
+	// later. The identity PGNs are only sent at power-up or on request, so
+	// without it last_seen would say when a device last introduced itself,
+	// not whether it is still on the bus.
+	pgnHeartbeat = 126993
 )
+
+// readPGNs is the filter pushed down to the all-pgn sensor: a few entries
+// per device rather than the whole bus history.
+var readPGNs = []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo, pgnHeartbeat}
 
 // identityFieldNames maps the gonmea field names of each identity PGN to the
 // snake_case keys this sensor reports.
@@ -218,13 +228,11 @@ func (s *nmeaDeviceDiscoveryDevicelist) Readings(ctx context.Context, extra map[
 	return devices, nil
 }
 
-// liveDevices filters the all-pgn history down to the identity PGNs and
-// merges them into one mergedDevice per stable identity, keyed by that
-// identity.
+// liveDevices filters the all-pgn history down to the identity PGNs (and
+// Heartbeat) and merges them into one mergedDevice per stable identity,
+// keyed by that identity.
 func (s *nmeaDeviceDiscoveryDevicelist) liveDevices(ctx context.Context) (map[string]mergedDevice, error) {
-	raw, err := s.allPgn.Readings(ctx, map[string]interface{}{
-		"pgns": []interface{}{pgnAddressClaim, pgnProductInfo, pgnConfigInfo},
-	})
+	raw, err := s.allPgn.Readings(ctx, map[string]interface{}{"pgns": readPGNs})
 	if err != nil {
 		return nil, fmt.Errorf("Reading from all-pgn-component: %w", err)
 	}
@@ -254,6 +262,12 @@ func (s *nmeaDeviceDiscoveryDevicelist) liveDevices(ctx context.Context) (map[st
 	// kept.
 	winners := map[string]mergedDevice{}
 	for src, entries := range perSrc {
+		// A heartbeat alone says something is at this address, not what. It
+		// only ever contributes a timestamp to a device identified by its
+		// identity PGNs, so it does not create a placeholder entry.
+		if !hasIdentityEntry(entries) {
+			continue
+		}
 		m := mergedDevice{src: src, fields: map[string]interface{}{}}
 		for pgn, entry := range entries {
 			for from, to := range identityFieldNames[pgn] {
@@ -286,6 +300,17 @@ func (s *nmeaDeviceDiscoveryDevicelist) liveDevices(ctx context.Context) (map[st
 		winners[m.identity] = m
 	}
 	return winners, nil
+}
+
+// hasIdentityEntry reports whether a source's entries include any of the
+// identity PGNs.
+func hasIdentityEntry(entries map[int]map[string]interface{}) bool {
+	for pgn := range entries {
+		if _, ok := identityFieldNames[pgn]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // parseTimestamp reads an all-pgn entry's timestamp. The raw string is
